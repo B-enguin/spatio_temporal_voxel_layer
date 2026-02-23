@@ -156,7 +156,7 @@ void MeasurementBuffer::BufferROSCloud(
       sor.setInputCloud(cloud_pcl);
       sor.setFilterFieldName("z");
       sor.setFilterLimits(_min_obstacle_height, _max_obstacle_height);
-      sor.setDownsampleAllData(false);
+      sor.setDownsampleAllData(true);
       float v_s = static_cast<float>(_voxel_size);
       sor.setLeafSize(v_s, v_s, v_s);
       sor.setMinimumPointsNumberPerVoxel(static_cast<unsigned int>(_voxel_min_points));

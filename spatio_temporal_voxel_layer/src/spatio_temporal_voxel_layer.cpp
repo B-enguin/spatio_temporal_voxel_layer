@@ -41,7 +41,6 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
-#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
@@ -151,6 +150,8 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   {
     _voxel_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
       "voxel_grid", rclcpp::QoS(1), pub_opt);
+    _voxel_semantics_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "voxel_grid_semantics", rclcpp::QoS(1), pub_opt);
   }
 
   auto save_grid_callback = std::bind(
@@ -337,15 +338,15 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     }
 
     std::function<void(const std::shared_ptr<rmw_request_id_t>,
-      std srvs::srv::SetBool::Request::SharedPtr,
-      std srvs::srv::SetBool::Response::SharedPtr)> toggle_srv_callback;
+      std_srvs::srv::SetBool::Request::SharedPtr,
+      std_srvs::srv::SetBool::Response::SharedPtr)> toggle_srv_callback;
 
     toggle_srv_callback = std::bind(
       &SpatioTemporalVoxelLayer::BufferEnablerCallback, this,
       _1, _2, _3, _observation_buffers.back(),
       _observation_subscribers.back());
     std::string toggle_topic = source + "/toggle_enabled";
-    auto server = node->create_service<std srvs::srv::SetBool>(
+    auto server = node->create_service<std_srvs::srv::SetBool>(
       toggle_topic, toggle_srv_callback, rmw_qos_profile_services_default, callback_group_);
 
     _buffer_enabler_servers.push_back(server);
@@ -447,8 +448,8 @@ void SpatioTemporalVoxelLayer::PointCloud2Callback(
 /*****************************************************************************/
 void SpatioTemporalVoxelLayer::BufferEnablerCallback(
   const std::shared_ptr<rmw_request_id_t>/*request_header*/,
-  const std::shared_ptr<std srvs::srv::SetBool::Request> request,
-  std::shared_ptr<std srvs::srv::SetBool::Response> response,
+  const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
+  std::shared_ptr<std_srvs::srv::SetBool::Response> response,
   const std::shared_ptr<buffer::MeasurementBuffer> buffer,
   const std::shared_ptr<message_filters::SubscriberBase<rclcpp_lifecycle::LifecycleNode>> &subcriber
   )
@@ -802,12 +803,19 @@ void SpatioTemporalVoxelLayer::updateBounds(
 
   // publish point cloud in navigation mode
   if (_publish_voxels && !_mapping_mode) {
-    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc2 =
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc_occ =
       std::make_unique<sensor_msgs::msg::PointCloud2>();
-    _voxel_grid->GetOccupancyPointCloud(pc2);
-    pc2->header.frame_id = _global_frame;
-    pc2->header.stamp = node->now();
-    _voxel_pub->publish(*pc2);
+    _voxel_grid->GetOccupancyPointCloud(pc_occ);
+    pc_occ->header.frame_id = _global_frame;
+    pc_occ->header.stamp = node->now();
+    _voxel_pub->publish(*pc_occ);
+
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc_sem =
+      std::make_unique<sensor_msgs::msg::PointCloud2>();
+    _voxel_grid->GetSemanticPointCloud(pc_sem);
+    pc_sem->header.frame_id = _global_frame;
+    pc_sem->header.stamp = node->now();
+    _voxel_semantics_pub->publish(*pc_sem);
   }
 
   // update footprint
@@ -969,6 +977,7 @@ void SpatioTemporalVoxelLayer::clearArea(
 }
 
 }  // namespace spatio_temporal_voxel_layer
+
 #include "pluginlib/class_list_macros.hpp"
 PLUGINLIB_EXPORT_CLASS(
   spatio_temporal_voxel_layer::SpatioTemporalVoxelLayer,

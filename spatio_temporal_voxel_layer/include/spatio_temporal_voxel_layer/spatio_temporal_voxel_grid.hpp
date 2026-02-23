@@ -142,6 +142,7 @@ public:
 
   // Get the pointcloud of the underlying occupancy grid
   void GetOccupancyPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
+  void GetSemanticPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
   std::unordered_map<occupany_cell, uint> * GetFlattenedCostmap();
 
   // Clear the grid
@@ -150,8 +151,6 @@ public:
 
   // Save the file to file with size information
   bool SaveGrid(const std::string & file_name, double & map_size_bytes);
-
-  void MarkInstances(const sensor_msgs::msg::PointCloud2 & cloud);
 
 protected:
   // Initialize grid metadata and library
