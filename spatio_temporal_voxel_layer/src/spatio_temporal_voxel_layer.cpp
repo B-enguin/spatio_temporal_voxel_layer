@@ -41,6 +41,7 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include "tf2_sensor_msgs/tf2_sensor_msgs.hpp"
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
@@ -336,15 +337,15 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
     }
 
     std::function<void(const std::shared_ptr<rmw_request_id_t>,
-      std_srvs::srv::SetBool::Request::SharedPtr,
-      std_srvs::srv::SetBool::Response::SharedPtr)> toggle_srv_callback;
+      std srvs::srv::SetBool::Request::SharedPtr,
+      std srvs::srv::SetBool::Response::SharedPtr)> toggle_srv_callback;
 
     toggle_srv_callback = std::bind(
       &SpatioTemporalVoxelLayer::BufferEnablerCallback, this,
       _1, _2, _3, _observation_buffers.back(),
       _observation_subscribers.back());
     std::string toggle_topic = source + "/toggle_enabled";
-    auto server = node->create_service<std_srvs::srv::SetBool>(
+    auto server = node->create_service<std srvs::srv::SetBool>(
       toggle_topic, toggle_srv_callback, rmw_qos_profile_services_default, callback_group_);
 
     _buffer_enabler_servers.push_back(server);
@@ -446,8 +447,8 @@ void SpatioTemporalVoxelLayer::PointCloud2Callback(
 /*****************************************************************************/
 void SpatioTemporalVoxelLayer::BufferEnablerCallback(
   const std::shared_ptr<rmw_request_id_t>/*request_header*/,
-  const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
-  std::shared_ptr<std_srvs::srv::SetBool::Response> response,
+  const std::shared_ptr<std srvs::srv::SetBool::Request> request,
+  std::shared_ptr<std srvs::srv::SetBool::Response> response,
   const std::shared_ptr<buffer::MeasurementBuffer> buffer,
   const std::shared_ptr<message_filters::SubscriberBase<rclcpp_lifecycle::LifecycleNode>> &subcriber
   )
@@ -968,7 +969,6 @@ void SpatioTemporalVoxelLayer::clearArea(
 }
 
 }  // namespace spatio_temporal_voxel_layer
-
 #include "pluginlib/class_list_macros.hpp"
 PLUGINLIB_EXPORT_CLASS(
   spatio_temporal_voxel_layer::SpatioTemporalVoxelLayer,

@@ -39,6 +39,7 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+#include <cstring>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_grid.hpp"
 
@@ -77,7 +78,7 @@ void SpatioTemporalVoxelGrid::InitializeGrid(void)
   openvdb::initialize();
 
   // make it default to background value
-  _grid = openvdb::DoubleGrid::create(_background_value);
+  _grid = openvdb::Vec3dGrid::create(openvdb::Vec3d(_background_value, 0.0, 0.0));
 
   // setup scale and tranform
   openvdb::Mat4d m = openvdb::Mat4d::identity();
@@ -155,7 +156,7 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
   const double cur_time = _clock->now().seconds();
 
   // check each point in the grid for inclusion in a frustum
-  openvdb::DoubleGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
+  openvdb::Vec3dGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
   for (; cit_grid.test(); ++cit_grid) {
     const openvdb::Coord pt_index(cit_grid.getCoord());
     const openvdb::Vec3d pose_world = this->IndexToWorld(pt_index);
@@ -164,7 +165,7 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
     bool frustum_cycle = false;
     bool cleared_point = false;
 
-    const double time_since_marking = cur_time - cit_grid.getValue();
+    const double time_since_marking = cur_time - cit_grid.getValue()[0];
     const double base_duration_to_decay = GetTemporalClearingDuration(
       time_since_marking);
 
@@ -189,7 +190,7 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
           }
           break;
         } else {
-          const double updated_mark = cit_grid.getValue() -
+          const double updated_mark = cit_grid.getValue()[0] -
             frustum_acceleration;
           if (!this->MarkGridPoint(pt_index, updated_mark)) {
             std::cout << "Failed to update mark." << std::endl;
@@ -400,7 +401,7 @@ void SpatioTemporalVoxelGrid::ResetGridArea(
 {
   boost::unique_lock<boost::mutex> lock(_grid_lock);
 
-  openvdb::DoubleGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
+  openvdb::Vec3dGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
   for (cit_grid; cit_grid.test(); ++cit_grid)
   {
     const openvdb::Coord pt_index(cit_grid.getCoord());
@@ -423,10 +424,14 @@ bool SpatioTemporalVoxelGrid::MarkGridPoint(
 /*****************************************************************************/
 {
   // marking the OpenVDB set
-  openvdb::DoubleGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
 
-  accessor.setValueOn(pt, value);
-  return accessor.getValue(pt) == value;
+  const openvdb::Vec3d existing =
+    accessor.isValueOn(pt) ? accessor.getValue(pt)
+                           : openvdb::Vec3d(_background_value, 0.0, 0.0);
+
+  accessor.setValueOn(pt, openvdb::Vec3d(value, existing[1], existing[2]));
+  return accessor.getValue(pt)[0] == value;
 }
 
 /*****************************************************************************/
@@ -434,10 +439,10 @@ bool SpatioTemporalVoxelGrid::ClearGridPoint(const openvdb::Coord & pt) const
 /*****************************************************************************/
 {
   // clearing the OpenVDB set
-  openvdb::DoubleGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
 
   if (accessor.isValueOn(pt)) {
-    accessor.setValueOff(pt, _background_value);
+    accessor.setValueOff(pt, openvdb::Vec3d(_background_value, 0.0, 0.0));
   }
   return !accessor.isValueOn(pt);
 }
@@ -493,6 +498,77 @@ bool SpatioTemporalVoxelGrid::SaveGrid(
     return false;
   }
   return false;  // best offense is a good defense
+}
+
+void SpatioTemporalVoxelGrid::MarkInstances(const sensor_msgs::msg::PointCloud2 & cloud)
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+
+  const sensor_msgs::msg::PointField * id_field = nullptr;
+  for (const auto & field : cloud.fields) {
+    if (field.name == "ID" || field.name == "id") {
+      id_field = &field;
+      break;
+    }
+  }
+  if (!id_field) {
+    return;
+  }
+
+  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+  sensor_msgs::PointCloud2ConstIterator<float> iter_x(cloud, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_z(cloud, "z");
+
+  std::size_t point_idx = 0;
+  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++point_idx) {
+    const std::size_t base = point_idx * cloud.point_step + id_field->offset;
+    if (base >= cloud.data.size()) {
+      continue;
+    }
+
+    double instance_id = 0.0;
+    switch (id_field->datatype) {
+      case sensor_msgs::msg::PointField::FLOAT32: {
+        if (base + sizeof(float) > cloud.data.size()) {continue;}
+        float v;
+        std::memcpy(&v, &cloud.data[base], sizeof(float));
+        instance_id = static_cast<double>(v);
+        break;
+      }
+      case sensor_msgs::msg::PointField::UINT32: {
+        if (base + sizeof(uint32_t) > cloud.data.size()) {continue;}
+        uint32_t v;
+        std::memcpy(&v, &cloud.data[base], sizeof(uint32_t));
+        instance_id = static_cast<double>(v);
+        break;
+      }
+      case sensor_msgs::msg::PointField::INT32: {
+        if (base + sizeof(int32_t) > cloud.data.size()) {continue;}
+        int32_t v;
+        std::memcpy(&v, &cloud.data[base], sizeof(int32_t));
+        instance_id = static_cast<double>(v);
+        break;
+      }
+      default:
+        continue;
+    }
+
+    const double x = *iter_x < 0 ? *iter_x - _voxel_size : *iter_x;
+    const double y = *iter_y < 0 ? *iter_y - _voxel_size : *iter_y;
+    const double z = *iter_z < 0 ? *iter_z - _voxel_size : *iter_z;
+
+    const openvdb::Vec3d idx = WorldToIndex(openvdb::Vec3d(x, y, z));
+    const openvdb::Coord coord(idx[0], idx[1], idx[2]);
+
+    if (!accessor.isValueOn(coord)) {
+      continue;
+    }
+
+    openvdb::Vec3d val = accessor.getValue(coord);
+    val[1] = instance_id;
+    accessor.setValueOn(coord, val);
+  }
 }
 
 }  // namespace volume_grid

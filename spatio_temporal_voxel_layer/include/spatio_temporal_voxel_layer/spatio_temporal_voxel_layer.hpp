@@ -145,6 +145,7 @@ private:
   void PointCloud2Callback(
     sensor_msgs::msg::PointCloud2::ConstSharedPtr message,
     const std::shared_ptr<buffer::MeasurementBuffer> & buffer);
+  void InstancesPointCloudCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr message);
 
   // Functions for adding static obstacle zones
   bool AddStaticObservations(const observation::MeasurementReading & obs);
@@ -152,8 +153,8 @@ private:
 
   // Enable/Disable callback
   void BufferEnablerCallback(const std::shared_ptr<rmw_request_id_t> request_header,
-    const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
-    std::shared_ptr<std_srvs::srv::SetBool::Response> response,
+    const std::shared_ptr<std srvs::srv::SetBool::Request> request,
+    std::shared_ptr<std srvs::srv::SetBool::Response> response,
     const std::shared_ptr<buffer::MeasurementBuffer> buffer,
     const std::shared_ptr<message_filters::SubscriberBase<rclcpp_lifecycle::LifecycleNode>>
       & subcriber
@@ -173,7 +174,7 @@ private:
   std::vector<std::shared_ptr<buffer::MeasurementBuffer>> _observation_buffers;
   std::vector<std::shared_ptr<buffer::MeasurementBuffer>> _marking_buffers;
   std::vector<std::shared_ptr<buffer::MeasurementBuffer>> _clearing_buffers;
-  std::vector<rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr> _buffer_enabler_servers;
+  std::vector<rclcpp::Service<std srvs::srv::SetBool>::SharedPtr> _buffer_enabler_servers;
 
   bool _publish_voxels, _mapping_mode, was_reset_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _voxel_pub;
@@ -194,6 +195,10 @@ private:
 
   // Dynamic parameters handler
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr dyn_params_handler;
+
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr _instances_sub;
+  std::string _instances_topic;
+
 };
 
 }  // namespace spatio_temporal_voxel_layer

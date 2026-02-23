@@ -151,6 +151,8 @@ public:
   // Save the file to file with size information
   bool SaveGrid(const std::string & file_name, double & map_size_bytes);
 
+  void MarkInstances(const sensor_msgs::msg::PointCloud2 & cloud);
+
 protected:
   // Initialize grid metadata and library
   void InitializeGrid(void);
@@ -179,7 +181,7 @@ protected:
 
   rclcpp::Clock::SharedPtr _clock;
 
-  mutable openvdb::DoubleGrid::Ptr _grid;
+  mutable openvdb::Vec3dGrid::Ptr _grid;
   int _decay_model;
   double _background_value, _voxel_size, _voxel_decay;
   bool _pub_voxels;
