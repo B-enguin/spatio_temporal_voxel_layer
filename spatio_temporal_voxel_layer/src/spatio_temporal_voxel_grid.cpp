@@ -285,7 +285,7 @@ void SpatioTemporalVoxelGrid::operator()(
     bool has_affordance = false;
     std::string id_field_name;
     for (const auto & field : cloud.fields) {
-      if (field.name == "ID" || field.name == "id") {
+      if (field.name == "id") {
         has_id = true;
         id_field_name = field.name;
       } else if (field.name == "affordance") {
@@ -441,7 +441,7 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
 
   for (openvdb::Vec3dGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
     const openvdb::Vec3d value = it.getValue();
-    const bool id_is_background = std::fabs(value[1] - bg[1]) <= eps;
+    const bool id_is_background = std::fabs(value[1] - 0) <= eps;
     if (id_is_background) {
       continue;
     }
@@ -461,13 +461,13 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
     "x", 1, sensor_msgs::msg::PointField::FLOAT32,
     "y", 1, sensor_msgs::msg::PointField::FLOAT32,
     "z", 1, sensor_msgs::msg::PointField::FLOAT32,
-    "ID", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "id", 1, sensor_msgs::msg::PointField::FLOAT32,
     "affordance", 1, sensor_msgs::msg::PointField::FLOAT32);
 
   sensor_msgs::PointCloud2Iterator<float> iter_x(*pc2, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(*pc2, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(*pc2, "z");
-  sensor_msgs::PointCloud2Iterator<float> iter_id(*pc2, "ID");
+  sensor_msgs::PointCloud2Iterator<float> iter_id(*pc2, "id");
   sensor_msgs::PointCloud2Iterator<float> iter_aff(*pc2, "affordance");
 
   for (size_t i = 0; i < points.size();
