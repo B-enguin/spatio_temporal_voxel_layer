@@ -143,7 +143,7 @@ public:
   // Get the pointcloud of the underlying occupancy grid
   void GetOccupancyPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
   void GetSemanticPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
-  std::unordered_map<occupany_cell, uint> * GetFlattenedCostmap();
+  std::unordered_map<occupany_cell, std::pair<uint, float>> * GetFlattenedCostmap();
 
   // Clear the grid
   bool ResetGrid(void);
@@ -178,6 +178,11 @@ protected:
   openvdb::Vec3d WorldToIndex(const openvdb::Vec3d & coord) const;
   openvdb::Vec3d IndexToWorld(const openvdb::Coord & coord) const;
 
+  // Payload convention:
+  // value[0] = timestamp
+  // value[1] = raw 64-bit payload: [id_u16, affordance0_f16, affordance1_f16, affordance2_f16]
+  // value[2] = raw 64-bit payload: [affordance3_f16, affordance4_f16, affordance5_f16, affordance6_f16]
+
   rclcpp::Clock::SharedPtr _clock;
 
   mutable openvdb::Vec3dGrid::Ptr _grid;
@@ -185,7 +190,7 @@ protected:
   double _background_value, _voxel_size, _voxel_decay;
   bool _pub_voxels;
   std::unique_ptr<std::vector<geometry_msgs::msg::Point32>> _grid_points;
-  std::unordered_map<occupany_cell, uint> * _cost_map;
+  std::unordered_map<occupany_cell, std::pair<uint, float>> * _cost_map;
   boost::mutex _grid_lock;
 };
 

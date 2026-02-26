@@ -41,11 +41,196 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_grid.hpp"
 
 namespace volume_grid
 {
+
+namespace
+{
+constexpr std::size_t kMaxAffordanceCount = 7;
+constexpr std::size_t kAffordancesInSecondValue = 3;
+
+inline uint16_t ToPackedU16(const float value)
+{
+  const float clamped = std::max(0.0f, std::min(65535.0f, value));
+  return static_cast<uint16_t>(std::lround(clamped));
+}
+
+inline uint16_t Float64ToFloat16Bits(const double value)
+{
+  if (std::isnan(value)) {return 0x7E00u;}
+  const bool neg = std::signbit(value);
+  const double av = std::fabs(value);
+
+  if (std::isinf(av)) {return static_cast<uint16_t>((neg ? 0x8000u : 0u) | 0x7C00u);}
+  if (av == 0.0) {return static_cast<uint16_t>(neg ? 0x8000u : 0u);}
+
+  int exp = 0;
+  const double frac = std::frexp(av, &exp);  // av = frac * 2^exp, frac in [0.5,1)
+  int half_exp = (exp - 1) + 15;
+
+  uint16_t sign = static_cast<uint16_t>(neg ? 0x8000u : 0u);
+
+  if (half_exp <= 0) {
+    // subnormal half: value = mantissa * 2^-24
+    int mant = static_cast<int>(std::lround(std::ldexp(av, 24)));
+    if (mant <= 0) {return sign;}
+    if (mant > 1023) {mant = 1023;}
+    return static_cast<uint16_t>(sign | static_cast<uint16_t>(mant));
+  }
+
+  if (half_exp >= 31) {
+    return static_cast<uint16_t>(sign | 0x7C00u);
+  }
+
+  int mant = static_cast<int>(std::lround((frac * 2.0 - 1.0) * 1024.0));
+  if (mant == 1024) {
+    mant = 0;
+    ++half_exp;
+    if (half_exp >= 31) {
+      return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+  }
+
+  return static_cast<uint16_t>(
+    sign | (static_cast<uint16_t>(half_exp) << 10) | static_cast<uint16_t>(mant));
+}
+
+inline double Float16BitsToFloat64(const uint16_t h)
+{
+  const bool neg = (h & 0x8000u) != 0;
+  const uint16_t exp = static_cast<uint16_t>((h >> 10) & 0x1Fu);
+  const uint16_t mant = static_cast<uint16_t>(h & 0x03FFu);
+
+  double out = 0.0;
+  if (exp == 0) {
+    out = (mant == 0) ? 0.0 : std::ldexp(static_cast<double>(mant), -24);
+  } else if (exp == 31) {
+    out = (mant == 0) ? std::numeric_limits<double>::infinity()
+                      : std::numeric_limits<double>::quiet_NaN();
+  } else {
+    out = std::ldexp(1.0 + static_cast<double>(mant) / 1024.0, static_cast<int>(exp) - 15);
+  }
+  return neg ? -out : out;
+}
+
+inline double Pack4xU16ToDouble(const std::array<uint16_t, 4> & words)
+{
+  const uint64_t raw =
+    (static_cast<uint64_t>(words[0]) << 48) |
+    (static_cast<uint64_t>(words[1]) << 32) |
+    (static_cast<uint64_t>(words[2]) << 16) |
+    static_cast<uint64_t>(words[3]);
+
+  double packed = 0.0;
+  std::memcpy(&packed, &raw, sizeof(double));
+  return packed;
+}
+
+inline std::array<uint16_t, 4> UnpackDoubleTo4xU16(const double packed)
+{
+  uint64_t raw = 0;
+  std::memcpy(&raw, &packed, sizeof(double));
+  return {
+    static_cast<uint16_t>((raw >> 48) & 0xFFFFu),
+    static_cast<uint16_t>((raw >> 32) & 0xFFFFu),
+    static_cast<uint16_t>((raw >> 16) & 0xFFFFu),
+    static_cast<uint16_t>(raw & 0xFFFFu)
+  };
+}
+
+inline bool IsAffordanceField(const std::string & name)
+{
+  return name.rfind("affordance", 0) == 0 && name != "affordance_count";
+}
+
+inline int ParseAffordanceIndex(const std::string & name, const int fallback)
+{
+  std::size_t end = name.size();
+  std::size_t start = end;
+  while (start > 0 && std::isdigit(static_cast<unsigned char>(name[start - 1]))) {
+    --start;
+  }
+  if (start == end) {
+    return fallback;
+  }
+  return std::stoi(name.substr(start, end - start));
+}
+
+inline std::vector<std::string> GetOrderedAffordanceFields(
+  const sensor_msgs::msg::PointCloud2 & cloud)
+{
+  std::vector<std::pair<int, std::string>> indexed_fields;
+  int fallback = 1000;
+  for (const auto & field : cloud.fields) {
+    if (!IsAffordanceField(field.name)) {
+      continue;
+    }
+    indexed_fields.emplace_back(ParseAffordanceIndex(field.name, fallback++), field.name);
+  }
+
+  std::sort(
+    indexed_fields.begin(), indexed_fields.end(),
+    [](const auto & a, const auto & b) {
+      return (a.first == b.first) ? (a.second < b.second) : (a.first < b.first);
+    });
+
+  std::vector<std::string> out;
+  out.reserve(indexed_fields.size());
+  for (const auto & it : indexed_fields) {
+    out.push_back(it.second);
+  }
+  return out;
+}
+
+inline double PackSecondValue(const float id, const std::vector<double> & affordances)
+{
+  std::array<uint16_t, 4> words = {ToPackedU16(id), 0, 0, 0};
+  for (std::size_t i = 0; i < kAffordancesInSecondValue && i < affordances.size(); ++i) {
+    words[i + 1] = Float64ToFloat16Bits(affordances[i]);
+  }
+  return Pack4xU16ToDouble(words);
+}
+
+inline double PackThirdValue(const std::vector<double> & affordances)
+{
+  std::array<uint16_t, 4> words = {0, 0, 0, 0};
+  for (std::size_t i = 0; i < 4; ++i) {
+    const std::size_t src = i + kAffordancesInSecondValue;
+    if (src < affordances.size()) {
+      words[i] = Float64ToFloat16Bits(affordances[src]);
+    }
+  }
+  return Pack4xU16ToDouble(words);
+}
+
+inline void UnpackSemanticPayload(
+  const openvdb::Vec3d & value, uint16_t & id, std::array<uint16_t, 7> & affordances_bits)
+{
+  const auto v1 = UnpackDoubleTo4xU16(value[1]);
+  const auto v2 = UnpackDoubleTo4xU16(value[2]);
+
+  id = v1[0];
+  affordances_bits = {v1[1], v1[2], v1[3], v2[0], v2[1], v2[2], v2[3]};
+}
+
+inline uint32_t CountNonZeroAffordances(const std::array<uint16_t, 7> & affordances_bits)
+{
+  uint32_t count = 0;
+  for (const auto a : affordances_bits) {
+    if (a != 0u) {
+      ++count;
+    }
+  }
+  return count;
+}
+}  // namespace
 
 /*****************************************************************************/
 SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
@@ -55,7 +240,7 @@ SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
   _voxel_size(voxel_size), _voxel_decay(voxel_decay), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
-  _cost_map(new std::unordered_map<occupany_cell, uint>)
+  _cost_map(new std::unordered_map<occupany_cell, std::pair<uint, float>>)
 /*****************************************************************************/
 {
   this->InitializeGrid();
@@ -241,14 +426,31 @@ void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
     _grid_points->push_back(point);
   }
 
-  std::unordered_map<occupany_cell, uint>::iterator cell;
+  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3d value = accessor.getValue(pt);
+
+  uint16_t unpacked_id = 0;
+  std::array<uint16_t, 7> unpacked_affordances_bits{};
+  UnpackSemanticPayload(value, unpacked_id, unpacked_affordances_bits);
+  (void)unpacked_id;
+
+  float affordance = 0.0f;
+  for (const auto bits : unpacked_affordances_bits) {
+    affordance = std::max(affordance, static_cast<float>(Float16BitsToFloat64(bits)));
+  }
+
+  std::unordered_map<occupany_cell, std::pair<uint, float>>::iterator cell;
   cell = _cost_map->find(occupany_cell(pose_world[0], pose_world[1]));
   if (cell != _cost_map->end()) {
-    cell->second += 1;
+    cell->second.first += 1;
+
+    if (affordance > cell->second.second) {
+      cell->second.second = affordance;
+    }
   } else {
     _cost_map->insert(
       std::make_pair(
-        occupany_cell(pose_world[0], pose_world[1]), 1));
+        occupany_cell(pose_world[0], pose_world[1]), std::make_pair(1, affordance)));
   }
 }
 
@@ -282,23 +484,39 @@ void SpatioTemporalVoxelGrid::operator()(
     sensor_msgs::PointCloud2ConstIterator<float> iter_z(cloud, "z");
 
     bool has_id = false;
-    bool has_affordance = false;
     std::string id_field_name;
     for (const auto & field : cloud.fields) {
       if (field.name == "id") {
         has_id = true;
         id_field_name = field.name;
-      } else if (field.name == "affordance") {
-        has_affordance = true;
+        break;
       }
+    }
+
+    std::vector<std::string> affordance_fields = GetOrderedAffordanceFields(cloud);
+    if (affordance_fields.size() > kMaxAffordanceCount) {
+      std::cout << "Received " << affordance_fields.size()
+                << " affordance fields; only first 7 are used." << std::endl;
+      affordance_fields.resize(kMaxAffordanceCount);
+    }
+
+    std::vector<sensor_msgs::PointCloud2ConstIterator<float>> iter_affordances;
+    iter_affordances.reserve(affordance_fields.size());
+    for (const auto & name : affordance_fields) {
+      iter_affordances.emplace_back(cloud, name);
+    }
+
+    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> iter_id;
+    if (has_id) {
+      iter_id =
+        std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(cloud, id_field_name);
     }
 
     openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
 
     auto update_voxel =
       [&](const float px, const float py, const float pz,
-      const bool set_id, const float id,
-      const bool set_affordance, const float affordance)
+      const float id, const std::vector<double> & affordances)
       {
         const float distance_2 =
           (px - obs._origin.x) * (px - obs._origin.x) +
@@ -321,42 +539,33 @@ void SpatioTemporalVoxelGrid::operator()(
           openvdb::Vec3d(_background_value, 0.0, 0.0);
 
         value[0] = cur_time;
-        if (set_id) {
-          value[1] = static_cast<double>(id);
-        }
-        if (set_affordance) {
-          value[2] = static_cast<double>(affordance);
-        }
+        value[1] = PackSecondValue(id, affordances);
+        value[2] = PackThirdValue(affordances);
 
         accessor.setValueOn(coord, value);
       };
 
-    if (has_id && has_affordance) {
-      sensor_msgs::PointCloud2ConstIterator<float> iter_id(cloud, id_field_name);
-      sensor_msgs::PointCloud2ConstIterator<float> iter_affordance(cloud, "affordance");
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++iter_id, ++iter_affordance) {
-        update_voxel(*iter_x, *iter_y, *iter_z, true, *iter_id, true, *iter_affordance);
+    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
+      float id_value = 0.0f;
+      if (iter_id) {
+        id_value = **iter_id;
+        ++(*iter_id);
       }
-    } else if (has_id) {
-      sensor_msgs::PointCloud2ConstIterator<float> iter_id(cloud, id_field_name);
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++iter_id) {
-        update_voxel(*iter_x, *iter_y, *iter_z, true, *iter_id, false, 0.0f);
+
+      std::vector<double> point_affordances;
+      point_affordances.reserve(iter_affordances.size());
+      for (auto & it : iter_affordances) {
+        point_affordances.push_back(static_cast<double>(*it));  // float64 source for f16 packing
+        ++it;
       }
-    } else if (has_affordance) {
-      sensor_msgs::PointCloud2ConstIterator<float> iter_affordance(cloud, "affordance");
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++iter_affordance) {
-        update_voxel(*iter_x, *iter_y, *iter_z, false, 0.0f, true, *iter_affordance);
-      }
-    } else {
-      for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
-        update_voxel(*iter_x, *iter_y, *iter_z, false, 0.0f, false, 0.0f);
-      }
+
+      update_voxel(*iter_x, *iter_y, *iter_z, id_value, point_affordances);
     }
   }
 }
 
 /*****************************************************************************/
-std::unordered_map<occupany_cell, uint> *
+std::unordered_map<occupany_cell, std::pair<uint, float>> *
 SpatioTemporalVoxelGrid::GetFlattenedCostmap()
 /*****************************************************************************/
 {
@@ -431,24 +640,30 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
 
   std::vector<openvdb::Vec3d> points;
   std::vector<float> ids;
-  std::vector<float> affordances;
+  std::vector<float> affordance_counts;
+  std::vector<std::array<uint16_t, 7>> affordances_bits;
   points.reserve(_grid->activeVoxelCount());
   ids.reserve(_grid->activeVoxelCount());
-  affordances.reserve(_grid->activeVoxelCount());
-
-  const openvdb::Vec3d bg = _grid->background();
-  constexpr double eps = 1e-6;
+  affordance_counts.reserve(_grid->activeVoxelCount());
+  affordances_bits.reserve(_grid->activeVoxelCount());
 
   for (openvdb::Vec3dGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
     const openvdb::Vec3d value = it.getValue();
-    const bool id_is_background = std::fabs(value[1] - 0) <= eps;
-    if (id_is_background) {
+
+    uint16_t id = 0;
+    std::array<uint16_t, 7> unpacked_affordances_bits{};
+    UnpackSemanticPayload(value, id, unpacked_affordances_bits);
+
+    const bool has_id = id != 0u;
+    const bool has_affordance = CountNonZeroAffordances(unpacked_affordances_bits) > 0u;
+    if (!has_id && !has_affordance) {
       continue;
     }
 
     points.push_back(IndexToWorld(it.getCoord()));
-    ids.push_back(static_cast<float>(value[1]));
-    affordances.push_back(static_cast<float>(value[2]));
+    ids.push_back(static_cast<float>(id));
+    affordance_counts.push_back(static_cast<float>(CountNonZeroAffordances(unpacked_affordances_bits)));
+    affordances_bits.push_back(unpacked_affordances_bits);
   }
 
   pc2->width = points.size();
@@ -457,27 +672,49 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
 
   sensor_msgs::PointCloud2Modifier modifier(*pc2);
   modifier.setPointCloud2Fields(
-    5,
+    12,
     "x", 1, sensor_msgs::msg::PointField::FLOAT32,
     "y", 1, sensor_msgs::msg::PointField::FLOAT32,
     "z", 1, sensor_msgs::msg::PointField::FLOAT32,
     "id", 1, sensor_msgs::msg::PointField::FLOAT32,
-    "affordance", 1, sensor_msgs::msg::PointField::FLOAT32);
+    "affordance_count", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_0", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_1", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_2", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_3", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_4", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_5", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "affordance_6", 1, sensor_msgs::msg::PointField::FLOAT32);
 
   sensor_msgs::PointCloud2Iterator<float> iter_x(*pc2, "x");
   sensor_msgs::PointCloud2Iterator<float> iter_y(*pc2, "y");
   sensor_msgs::PointCloud2Iterator<float> iter_z(*pc2, "z");
   sensor_msgs::PointCloud2Iterator<float> iter_id(*pc2, "id");
-  sensor_msgs::PointCloud2Iterator<float> iter_aff(*pc2, "affordance");
+  sensor_msgs::PointCloud2Iterator<float> iter_count(*pc2, "affordance_count");
+  sensor_msgs::PointCloud2Iterator<float> iter_a0(*pc2, "affordance_0");
+  sensor_msgs::PointCloud2Iterator<float> iter_a1(*pc2, "affordance_1");
+  sensor_msgs::PointCloud2Iterator<float> iter_a2(*pc2, "affordance_2");
+  sensor_msgs::PointCloud2Iterator<float> iter_a3(*pc2, "affordance_3");
+  sensor_msgs::PointCloud2Iterator<float> iter_a4(*pc2, "affordance_4");
+  sensor_msgs::PointCloud2Iterator<float> iter_a5(*pc2, "affordance_5");
+  sensor_msgs::PointCloud2Iterator<float> iter_a6(*pc2, "affordance_6");
 
-  for (size_t i = 0; i < points.size();
-    ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_id, ++iter_aff)
-  {
+  for (size_t i = 0; i < points.size(); ++i) {
     *iter_x = static_cast<float>(points[i][0]);
     *iter_y = static_cast<float>(points[i][1]);
     *iter_z = static_cast<float>(points[i][2]);
     *iter_id = ids[i];
-    *iter_aff = affordances[i];
+    *iter_count = affordance_counts[i];
+    *iter_a0 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][0]));
+    *iter_a1 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][1]));
+    *iter_a2 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][2]));
+    *iter_a3 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][3]));
+    *iter_a4 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][4]));
+    *iter_a5 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][5]));
+    *iter_a6 = static_cast<float>(Float16BitsToFloat64(affordances_bits[i][6]));
+
+    ++iter_x; ++iter_y; ++iter_z; ++iter_id; ++iter_count;
+    ++iter_a0; ++iter_a1; ++iter_a2; ++iter_a3; ++iter_a4; ++iter_a5; ++iter_a6;
   }
 }
 

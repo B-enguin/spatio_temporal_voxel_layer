@@ -711,17 +711,22 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
   // grabs map of occupied cells from grid and adds to costmap_
   Costmap2D::resetMaps();
 
-  std::unordered_map<volume_grid::occupany_cell, uint>::iterator it;
+  std::unordered_map<volume_grid::occupany_cell, std::pair<uint, float>>::iterator it;
   for (it = _voxel_grid->GetFlattenedCostmap()->begin();
     it != _voxel_grid->GetFlattenedCostmap()->end(); ++it)
   {
     uint map_x, map_y;
-    if (static_cast<int>(it->second) >= _mark_threshold &&
+    if (static_cast<int>(it->second.first) >= _mark_threshold &&
       worldToMap(it->first.x, it->first.y, map_x, map_y))
     {
-      costmap_[getIndex(map_x, map_y)] = nav2_costmap_2d::LETHAL_OBSTACLE;
-      touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
-    }
+
+      if (static_cast<int>(it->second.second) == 0) {
+        costmap_[getIndex(map_x, map_y)] = nav2_costmap_2d::LETHAL_OBSTACLE;
+        touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
+      } else {
+        costmap_[getIndex(map_x, map_y)] = (1 - it->second.second) * nav2_costmap_2d::LETHAL_OBSTACLE;
+        touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
+      }
   }
 
   std::unordered_set<volume_grid::occupany_cell>::iterator cell;
@@ -729,6 +734,7 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
   {
     touch(cell->x, cell->y, min_x, min_y, max_x, max_y);
   }
+}
 }
 
 /*****************************************************************************/
