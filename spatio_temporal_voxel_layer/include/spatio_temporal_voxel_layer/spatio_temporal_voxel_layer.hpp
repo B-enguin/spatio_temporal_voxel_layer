@@ -185,6 +185,7 @@ private:
   std::string _global_frame;
   double _voxel_size, _voxel_decay;
   int _combination_method, _mark_threshold;
+  uint32_t _max_affordances;
   volume_grid::GlobalDecayModel _decay_model;
   bool _update_footprint_enabled, _enabled;
   std::vector<geometry_msgs::msg::Point> _transformed_footprint;

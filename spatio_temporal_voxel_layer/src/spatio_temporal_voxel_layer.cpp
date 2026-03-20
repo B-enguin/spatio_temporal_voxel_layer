@@ -105,6 +105,12 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // number of voxels per vertical needed to have obstacle
   declareParameter("mark_threshold", rclcpp::ParameterValue(0));
   node->get_parameter(name_ + ".mark_threshold", _mark_threshold);
+
+  declareParameter("max_affordances", rclcpp::ParameterValue(0));  // 0 => unlimited
+  int max_affordances_param = 0;
+  node->get_parameter(name_ + ".max_affordances", max_affordances_param);
+  _max_affordances = max_affordances_param > 0 ? static_cast<uint32_t>(max_affordances_param) : 0u;
+
   // clear under robot footprint
   declareParameter("update_footprint_enabled", rclcpp::ParameterValue(true));
   node->get_parameter(name_ + ".update_footprint_enabled", _update_footprint_enabled);
@@ -161,7 +167,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels);
+    _voxel_decay, _publish_voxels, _max_affordances);
 
   matchSize();
 
@@ -720,11 +726,14 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
       worldToMap(it->first.x, it->first.y, map_x, map_y))
     {
 
-      if (static_cast<int>(it->second.second) == 0) {
+      
+
+      if (it->second.second == 0.0) {
         costmap_[getIndex(map_x, map_y)] = nav2_costmap_2d::LETHAL_OBSTACLE;
         touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
       } else {
-        costmap_[getIndex(map_x, map_y)] = (1 - it->second.second) * nav2_costmap_2d::LETHAL_OBSTACLE;
+
+        costmap_[getIndex(map_x, map_y)] = static_cast<int>((1 - it->second.second) * nav2_costmap_2d::LETHAL_OBSTACLE);
         touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
       }
   }

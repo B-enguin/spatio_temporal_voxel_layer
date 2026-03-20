@@ -50,6 +50,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdint>
 // PCL
 #include "pcl/common/transforms.h"
 #include "pcl/PCLPointCloud2.h"
@@ -130,12 +131,12 @@ public:
     rclcpp::Clock::SharedPtr clock,
     const float & voxel_size, const double & background_value,
     const int & decay_model, const double & voxel_decay,
-    const bool & pub_voxels);
+    const bool & pub_voxels, const uint32_t & max_affordances);
   ~SpatioTemporalVoxelGrid(void);
 
   // Core making and clearing functions
   void Mark(const std::vector<observation::MeasurementReading> & marking_observations);
-  void operator()(const observation::MeasurementReading & obs) const;
+  void operator()(const observation::MeasurementReading & obs);
   void ClearFrustums(
     const std::vector<observation::MeasurementReading> & clearing_observations,
     std::unordered_set<occupany_cell> & cleared_cells);
@@ -180,8 +181,8 @@ protected:
 
   // Payload convention:
   // value[0] = timestamp
-  // value[1] = raw 64-bit payload: [id_u16, affordance0_f16, affordance1_f16, affordance2_f16]
-  // value[2] = raw 64-bit payload: [affordance3_f16, affordance4_f16, affordance5_f16, affordance6_f16]
+  // value[1] = object id (stored as double)
+  // value[2] = reserved placeholder
 
   rclcpp::Clock::SharedPtr _clock;
 
@@ -191,6 +192,11 @@ protected:
   bool _pub_voxels;
   std::unique_ptr<std::vector<geometry_msgs::msg::Point32>> _grid_points;
   std::unordered_map<occupany_cell, std::pair<uint, float>> * _cost_map;
+
+  // Dynamic affordance storage keyed by object id.
+  std::unordered_map<uint64_t, std::vector<double>> _affordance_map;
+  uint32_t _max_affordances;
+
   boost::mutex _grid_lock;
 };
 
