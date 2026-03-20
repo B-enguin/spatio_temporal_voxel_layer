@@ -116,13 +116,14 @@ SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
   rclcpp::Clock::SharedPtr clock,
   const float & voxel_size, const double & background_value,
   const int & decay_model, const double & voxel_decay, const bool & pub_voxels,
-  const uint32_t & max_affordances)
+  const uint32_t & max_affordances, const double & afforded_factor)
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
   _voxel_size(voxel_size), _voxel_decay(voxel_decay), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
   _cost_map(new std::unordered_map<occupany_cell, std::pair<uint, float>>),
   _affordance_map(std::unordered_map<uint64_t, std::vector<double>>()),
-  _max_affordances(max_affordances)
+  _max_affordances(max_affordances),
+  _afforded_factor(std::max(0.0, afforded_factor))
 /*****************************************************************************/
 {
   this->InitializeGrid();
@@ -234,8 +235,10 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
     bool cleared_point = false;
 
     const double time_since_marking = cur_time - cit_grid.getValue()[0];
-    const double base_duration_to_decay = GetTemporalClearingDuration(
-      time_since_marking);
+    double base_duration_to_decay = GetTemporalClearingDuration(time_since_marking);
+    if (HasAffordances(cit_grid.getValue())) {
+      base_duration_to_decay *= _afforded_factor;
+    }
 
     for (; frustum_it != frustums.end(); ++frustum_it) {
       if (!frustum_it->frustum) {
@@ -290,6 +293,19 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 
   // free memory taken by expired voxels
   _grid->pruneGrid();
+}
+
+/*****************************************************************************/
+bool SpatioTemporalVoxelGrid::HasAffordances(const openvdb::Vec3d & value) const
+/*****************************************************************************/
+{
+  const uint64_t id = ToIdKey(value[1]);
+  if (id == 0u) {
+    return false;
+  }
+
+  const auto affordance_it = _affordance_map.find(id);
+  return affordance_it != _affordance_map.end() && !affordance_it->second.empty();
 }
 
 /*****************************************************************************/

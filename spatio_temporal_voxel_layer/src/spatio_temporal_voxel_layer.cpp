@@ -125,6 +125,16 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // decay param
   declareParameter("voxel_decay", rclcpp::ParameterValue(-1.0));
   node->get_parameter(name_ + ".voxel_decay", _voxel_decay);
+  // scales temporal clearing duration for voxels that carry affordance values
+  declareParameter("afforded_factor", rclcpp::ParameterValue(1.0));
+  node->get_parameter(name_ + ".afforded_factor", _afforded_factor);
+  if (_afforded_factor < 0.0) {
+    RCLCPP_WARN(
+      logger_,
+      "%s: afforded_factor %.3f is negative, clamping to 0.0.",
+      getName().c_str(), _afforded_factor);
+    _afforded_factor = 0.0;
+  }
   // whether to map or navigate
   declareParameter("mapping_mode", rclcpp::ParameterValue(false));
   node->get_parameter(name_ + ".mapping_mode", _mapping_mode);
@@ -167,7 +177,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels, _max_affordances);
+    _voxel_decay, _publish_voxels, _max_affordances, _afforded_factor);
 
   matchSize();
 

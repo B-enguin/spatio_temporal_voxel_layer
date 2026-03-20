@@ -131,7 +131,8 @@ public:
     rclcpp::Clock::SharedPtr clock,
     const float & voxel_size, const double & background_value,
     const int & decay_model, const double & voxel_decay,
-    const bool & pub_voxels, const uint32_t & max_affordances);
+    const bool & pub_voxels, const uint32_t & max_affordances,
+    const double & afforded_factor);
   ~SpatioTemporalVoxelGrid(void);
 
   // Core making and clearing functions
@@ -166,6 +167,7 @@ protected:
 
   // Get time information for clearing
   double GetTemporalClearingDuration(const double & time_delta);
+  bool HasAffordances(const openvdb::Vec3d & value) const;
   double GetFrustumAcceleration(
     const double & time_delta, const double & acceleration_factor);
   void TemporalClearAndGenerateCostmap(
@@ -196,6 +198,7 @@ protected:
   // Dynamic affordance storage keyed by object id.
   std::unordered_map<uint64_t, std::vector<double>> _affordance_map;
   uint32_t _max_affordances;
+  double _afforded_factor;
 
   boost::mutex _grid_lock;
 };
