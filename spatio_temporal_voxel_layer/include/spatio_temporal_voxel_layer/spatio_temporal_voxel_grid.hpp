@@ -132,7 +132,7 @@ public:
     const float & voxel_size, const double & background_value,
     const int & decay_model, const double & voxel_decay,
     const bool & pub_voxels, const uint32_t & max_affordances,
-    const double & afforded_factor);
+    const double & afforded_factor, const double & occupied_threshold);
   ~SpatioTemporalVoxelGrid(void);
 
   // Core making and clearing functions
@@ -153,6 +153,8 @@ public:
 
   // Save the file to file with size information
   bool SaveGrid(const std::string & file_name, double & map_size_bytes);
+
+  void SetOccupiedThreshold(const double & occupied_threshold);
 
 protected:
   // Initialize grid metadata and library
@@ -184,7 +186,7 @@ protected:
   // Payload convention:
   // value[0] = timestamp
   // value[1] = object id (stored as double)
-  // value[2] = reserved placeholder
+  // value[2] = occupancy likelihood [0.0, 1.0]
 
   rclcpp::Clock::SharedPtr _clock;
 
@@ -199,6 +201,7 @@ protected:
   std::unordered_map<uint64_t, std::vector<double>> _affordance_map;
   uint32_t _max_affordances;
   double _afforded_factor;
+  double _occupied_threshold;
 
   boost::mutex _grid_lock;
 };

@@ -71,6 +71,11 @@ inline bool IsAffordanceField(const std::string & name)
   return name.rfind("affordance", 0) == 0 && name != "affordance_count";
 }
 
+inline double Clamp01(const double value)
+{
+  return std::max(0.0, std::min(1.0, value));
+}
+
 inline int ParseAffordanceIndex(const std::string & name, const int fallback)
 {
   std::size_t end = name.size();
@@ -116,14 +121,16 @@ SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
   rclcpp::Clock::SharedPtr clock,
   const float & voxel_size, const double & background_value,
   const int & decay_model, const double & voxel_decay, const bool & pub_voxels,
-  const uint32_t & max_affordances, const double & afforded_factor)
+  const uint32_t & max_affordances, const double & afforded_factor,
+  const double & occupied_threshold)
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
   _voxel_size(voxel_size), _voxel_decay(voxel_decay), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
   _cost_map(new std::unordered_map<occupany_cell, std::pair<uint, float>>),
   _affordance_map(std::unordered_map<uint64_t, std::vector<double>>()),
   _max_affordances(max_affordances),
-  _afforded_factor(std::max(0.0, afforded_factor))
+  _afforded_factor(std::max(0.0, afforded_factor)),
+  _occupied_threshold(Clamp01(occupied_threshold))
 /*****************************************************************************/
 {
   this->InitializeGrid();
@@ -253,11 +260,20 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 
         const double time_until_decay = base_duration_to_decay -
           frustum_acceleration;
+
+        const openvdb::Vec3d cur_value = cit_grid.getValue();
+        const double updated_occupancy = 0.5 * Clamp01(cur_value[2]);
+
         if (time_until_decay < 0.) {
-          // expired by acceleration
-          cleared_point = true;
-          if (!this->ClearGridPoint(pt_index)) {
-            std::cout << "Failed to clear point." << std::endl;
+          // accelerated temporal decay and lower occupancy confidence
+          const double updated_mark = cur_time - _voxel_decay;
+          if (!this->MarkGridPoint(pt_index, updated_mark)) {
+            std::cout << "Failed to update mark." << std::endl;
+          } else {
+            openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+            openvdb::Vec3d updated_value = accessor.getValue(pt_index);
+            updated_value[2] = updated_occupancy;
+            accessor.setValueOn(pt_index, updated_value);
           }
           break;
         } else {
@@ -265,6 +281,11 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
             frustum_acceleration;
           if (!this->MarkGridPoint(pt_index, updated_mark)) {
             std::cout << "Failed to update mark." << std::endl;
+          } else {
+            openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+            openvdb::Vec3d updated_value = accessor.getValue(pt_index);
+            updated_value[2] = updated_occupancy;
+            accessor.setValueOn(pt_index, updated_value);
           }
           break;
         }
@@ -314,6 +335,13 @@ void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
 /*****************************************************************************/
 {
   // add pt to the pointcloud and costmap
+  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3d value = accessor.getValue(pt);
+
+  if (Clamp01(value[2]) <= _occupied_threshold) {
+    return;
+  }
+
   openvdb::Vec3d pose_world = this->IndexToWorld(pt);
 
   if (_pub_voxels) {
@@ -323,9 +351,6 @@ void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
     point.z = pose_world[2];
     _grid_points->push_back(point);
   }
-
-  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
-  openvdb::Vec3d value = accessor.getValue(pt);
 
   const uint64_t id_key = ToIdKey(value[1]);
   float affordance = 0.0f;
@@ -445,12 +470,14 @@ void SpatioTemporalVoxelGrid::operator()(
           accessor.getValue(coord) :
           openvdb::Vec3d(_background_value, 0.0, 0.0);
 
+        const double existing_occupancy = Clamp01(value[2]);
+
         // Use id_key is non-zero, otherwise preserve existing id if present
         value[0] = cur_time;
         if (id_key != 0u) {
           value[1] = static_cast<double>(id_key);
-          value[2] = 0.0;                          // reserved placeholder
         }
+        value[2] = 0.5 * (existing_occupancy + 1.0);
         
         accessor.setValueOn(coord, value);
 
@@ -570,6 +597,11 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
   for (openvdb::Vec3dGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
     const openvdb::Vec3d value = it.getValue();
     const uint64_t id = ToIdKey(value[1]);
+    const float is_occupied = static_cast<float>(Clamp01(value[2]));
+
+    if (is_occupied <= _occupied_threshold) {
+      continue;
+    }
 
     std::vector<float> affordances;
     auto a_it = _affordance_map.find(id);
@@ -637,6 +669,14 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
       write_f32(base, static_cast<uint32_t>(20 + (j * 4)), affordances_per_point[i][j]);
     }
   }
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelGrid::SetOccupiedThreshold(const double & occupied_threshold)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+  _occupied_threshold = Clamp01(occupied_threshold);
 }
 
 /*****************************************************************************/

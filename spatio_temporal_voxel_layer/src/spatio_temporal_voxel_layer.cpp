@@ -41,6 +41,7 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
+#include <algorithm>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
@@ -105,6 +106,10 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // number of voxels per vertical needed to have obstacle
   declareParameter("mark_threshold", rclcpp::ParameterValue(0));
   node->get_parameter(name_ + ".mark_threshold", _mark_threshold);
+
+  declareParameter("occupied_threshold", rclcpp::ParameterValue(0.5));
+  node->get_parameter(name_ + ".occupied_threshold", _occupied_threshold);
+  _occupied_threshold = std::max(0.0, std::min(1.0, _occupied_threshold));
 
   declareParameter("max_affordances", rclcpp::ParameterValue(0));  // 0 => unlimited
   int max_affordances_param = 0;
@@ -177,7 +182,8 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels, _max_affordances, _afforded_factor);
+    _voxel_decay, _publish_voxels, _max_affordances, _afforded_factor,
+    _occupied_threshold);
 
   matchSize();
 
@@ -727,25 +733,52 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
   // grabs map of occupied cells from grid and adds to costmap_
   Costmap2D::resetMaps();
 
+  auto set_cost_and_touch =
+    [&](const uint mx, const uint my, const unsigned char cost_value)
+    {
+      costmap_[getIndex(mx, my)] = cost_value;
+      double wx, wy;
+      mapToWorld(mx, my, wx, wy);
+      touch(wx, wy, min_x, min_y, max_x, max_y);
+    };
+
   std::unordered_map<volume_grid::occupany_cell, std::pair<uint, float>>::iterator it;
   for (it = _voxel_grid->GetFlattenedCostmap()->begin();
     it != _voxel_grid->GetFlattenedCostmap()->end(); ++it)
   {
     uint map_x, map_y;
-    if (static_cast<int>(it->second.first) >= _mark_threshold &&
-      worldToMap(it->first.x, it->first.y, map_x, map_y))
+    if (static_cast<int>(it->second.first) < _mark_threshold ||
+      !worldToMap(it->first.x, it->first.y, map_x, map_y))
     {
+      continue;
+    }
 
-      
+    const float affordance = it->second.second;
+    const unsigned char cost_value = affordance == 0.0f ?
+      nav2_costmap_2d::LETHAL_OBSTACLE :
+      static_cast<unsigned char>((1.0f - affordance) * nav2_costmap_2d::LETHAL_OBSTACLE);
 
-      if (it->second.second == 0.0) {
-        costmap_[getIndex(map_x, map_y)] = nav2_costmap_2d::LETHAL_OBSTACLE;
-        touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
-      } else {
+    set_cost_and_touch(map_x, map_y, cost_value);
 
-        costmap_[getIndex(map_x, map_y)] = static_cast<int>((1 - it->second.second) * nav2_costmap_2d::LETHAL_OBSTACLE);
-        touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
+    if (affordance > 0.0f) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          if (dx == 0 && dy == 0) {
+            continue;
+          }
+
+          const int nx = static_cast<int>(map_x) + dx;
+          const int ny = static_cast<int>(map_y) + dy;
+          if (nx < 0 || ny < 0 ||
+            nx >= static_cast<int>(getSizeInCellsX()) ||
+            ny >= static_cast<int>(getSizeInCellsY()))
+          {
+            continue;
+          }
+          set_cost_and_touch(static_cast<uint>(nx), static_cast<uint>(ny), cost_value);
+        }
       }
+    }
   }
 
   std::unordered_set<volume_grid::occupany_cell>::iterator cell;
@@ -753,7 +786,6 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
   {
     touch(cell->x, cell->y, min_x, min_y, max_x, max_y);
   }
-}
 }
 
 /*****************************************************************************/
@@ -977,6 +1009,17 @@ SpatioTemporalVoxelLayer::dynamicParametersCallback(std::vector<rclcpp::Paramete
     if (type == ParameterType::PARAMETER_INTEGER) {
       if (name == name_ + "." + "mark_threshold") {
         _mark_threshold = parameter.as_int();
+      }
+    }
+
+    if (type == ParameterType::PARAMETER_DOUBLE) {
+      if (name == name_ + "." + "occupied_threshold") {
+        const double clamped = std::max(0.0, std::min(1.0, parameter.as_double()));
+        _occupied_threshold = clamped;
+        if (_voxel_grid) {
+          boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+          _voxel_grid->SetOccupiedThreshold(_occupied_threshold);
+        }
       }
     }
   }
