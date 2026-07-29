@@ -41,7 +41,6 @@
 #include <unordered_map>
 #include <memory>
 #include <vector>
-#include <algorithm>
 
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_layer.hpp"
 
@@ -106,16 +105,6 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // number of voxels per vertical needed to have obstacle
   declareParameter("mark_threshold", rclcpp::ParameterValue(0));
   node->get_parameter(name_ + ".mark_threshold", _mark_threshold);
-
-  declareParameter("occupied_threshold", rclcpp::ParameterValue(0.5));
-  node->get_parameter(name_ + ".occupied_threshold", _occupied_threshold);
-  _occupied_threshold = std::max(0.0, std::min(1.0, _occupied_threshold));
-
-  declareParameter("max_affordances", rclcpp::ParameterValue(0));  // 0 => unlimited
-  int max_affordances_param = 0;
-  node->get_parameter(name_ + ".max_affordances", max_affordances_param);
-  _max_affordances = max_affordances_param > 0 ? static_cast<uint32_t>(max_affordances_param) : 0u;
-
   // clear under robot footprint
   declareParameter("update_footprint_enabled", rclcpp::ParameterValue(true));
   node->get_parameter(name_ + ".update_footprint_enabled", _update_footprint_enabled);
@@ -130,16 +119,6 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // decay param
   declareParameter("voxel_decay", rclcpp::ParameterValue(-1.0));
   node->get_parameter(name_ + ".voxel_decay", _voxel_decay);
-  // scales temporal clearing duration for voxels that carry affordance values
-  declareParameter("afforded_factor", rclcpp::ParameterValue(1.0));
-  node->get_parameter(name_ + ".afforded_factor", _afforded_factor);
-  if (_afforded_factor < 0.0) {
-    RCLCPP_WARN(
-      logger_,
-      "%s: afforded_factor %.3f is negative, clamping to 0.0.",
-      getName().c_str(), _afforded_factor);
-    _afforded_factor = 0.0;
-  }
   // whether to map or navigate
   declareParameter("mapping_mode", rclcpp::ParameterValue(false));
   node->get_parameter(name_ + ".mapping_mode", _mapping_mode);
@@ -171,8 +150,6 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   {
     _voxel_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
       "voxel_grid", rclcpp::QoS(1), pub_opt);
-    _voxel_semantics_pub = node->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "voxel_grid_semantics", rclcpp::QoS(1), pub_opt);
   }
 
   auto save_grid_callback = std::bind(
@@ -180,10 +157,24 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   _grid_saver = node->create_service<spatio_temporal_voxel_layer::srv::SaveGrid>(
     "save_grid", save_grid_callback, rmw_qos_profile_services_default, callback_group_);
 
+  auto add_object_callback = std::bind(
+    &SpatioTemporalVoxelLayer::AddObjectCallback, this, _1, _2, _3);
+  _object_adder = node->create_service<spatio_temporal_voxel_layer::srv::AddObject>(
+    "add_object", add_object_callback, rmw_qos_profile_services_default, callback_group_);
+
+  auto query_object_callback = std::bind(
+    &SpatioTemporalVoxelLayer::QueryObjectCallback, this, _1, _2, _3);
+  _object_query = node->create_service<spatio_temporal_voxel_layer::srv::QueryObject>(
+    "query_object", query_object_callback, rmw_qos_profile_services_default, callback_group_);
+
+  auto update_object_callback = std::bind(
+    &SpatioTemporalVoxelLayer::UpdateObjectCallback, this, _1, _2, _3);
+  _object_updater = node->create_service<spatio_temporal_voxel_layer::srv::UpdateObject>(
+    "update_object", update_object_callback, rmw_qos_profile_services_default, callback_group_);
+
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels, _max_affordances, _afforded_factor,
-    _occupied_threshold);
+    _voxel_decay, _publish_voxels);
 
   matchSize();
 
@@ -733,51 +724,15 @@ void SpatioTemporalVoxelLayer::UpdateROSCostmap(
   // grabs map of occupied cells from grid and adds to costmap_
   Costmap2D::resetMaps();
 
-  auto set_cost_and_touch =
-    [&](const uint mx, const uint my, const unsigned char cost_value)
-    {
-      costmap_[getIndex(mx, my)] = cost_value;
-      double wx, wy;
-      mapToWorld(mx, my, wx, wy);
-      touch(wx, wy, min_x, min_y, max_x, max_y);
-    };
-
-  std::unordered_map<volume_grid::occupany_cell, std::pair<uint, float>>::iterator it;
+  std::unordered_map<volume_grid::occupany_cell, uint>::iterator it;
   for (it = _voxel_grid->GetFlattenedCostmap()->begin();
     it != _voxel_grid->GetFlattenedCostmap()->end(); ++it)
   {
     uint map_x, map_y;
-    if (static_cast<int>(it->second.first) < _mark_threshold ||
-      !worldToMap(it->first.x, it->first.y, map_x, map_y))
+    if (worldToMap(it->first.x, it->first.y, map_x, map_y))
     {
-      continue;
-    }
-
-    const float affordance = it->second.second;
-    const unsigned char cost_value = affordance == 0.0f ?
-      nav2_costmap_2d::LETHAL_OBSTACLE :
-      static_cast<unsigned char>((1.0f - affordance) * nav2_costmap_2d::LETHAL_OBSTACLE);
-
-    set_cost_and_touch(map_x, map_y, cost_value);
-
-    if (affordance > 0.0f) {
-      for (int dx = -1; dx <= 1; ++dx) {
-        for (int dy = -1; dy <= 1; ++dy) {
-          if (dx == 0 && dy == 0) {
-            continue;
-          }
-
-          const int nx = static_cast<int>(map_x) + dx;
-          const int ny = static_cast<int>(map_y) + dy;
-          if (nx < 0 || ny < 0 ||
-            nx >= static_cast<int>(getSizeInCellsX()) ||
-            ny >= static_cast<int>(getSizeInCellsY()))
-          {
-            continue;
-          }
-          set_cost_and_touch(static_cast<uint>(nx), static_cast<uint>(ny), cost_value);
-        }
-      }
+      costmap_[getIndex(map_x, map_y)] = static_cast<unsigned char>(it->second);
+      touch(it->first.x, it->first.y, min_x, min_y, max_x, max_y);
     }
   }
 
@@ -860,19 +815,12 @@ void SpatioTemporalVoxelLayer::updateBounds(
 
   // publish point cloud in navigation mode
   if (_publish_voxels && !_mapping_mode) {
-    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc_occ =
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc2 =
       std::make_unique<sensor_msgs::msg::PointCloud2>();
-    _voxel_grid->GetOccupancyPointCloud(pc_occ);
-    pc_occ->header.frame_id = _global_frame;
-    pc_occ->header.stamp = node->now();
-    _voxel_pub->publish(*pc_occ);
-
-    std::unique_ptr<sensor_msgs::msg::PointCloud2> pc_sem =
-      std::make_unique<sensor_msgs::msg::PointCloud2>();
-    _voxel_grid->GetSemanticPointCloud(pc_sem);
-    pc_sem->header.frame_id = _global_frame;
-    pc_sem->header.stamp = node->now();
-    _voxel_semantics_pub->publish(*pc_sem);
+    _voxel_grid->GetOccupancyPointCloud(pc2);
+    pc2->header.frame_id = _global_frame;
+    pc2->header.stamp = node->now();
+    _voxel_pub->publish(*pc2);
   }
 
   // update footprint
@@ -901,6 +849,81 @@ void SpatioTemporalVoxelLayer::SaveGridCallback(
 
   RCLCPP_WARN(logger_, "SpatioTemporalVoxelLayer: Failed to save grid.");
   resp->status = false;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::AddObjectCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::AddObject::Request> req,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::AddObject::Response> resp)
+/*****************************************************************************/
+{
+  boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+
+  if (!_voxel_grid || req->id <= 0) {
+    resp->completed = false;
+    return;
+  }
+
+  std::unordered_map<std::string, volume_grid::ObjectInstance::AlphaBetaPair> affordances;
+  for (const auto & affordance : req->affordances) {
+    affordances[affordance.affordance_name] =
+      volume_grid::ObjectInstance::AlphaBetaPair(affordance.alpha, affordance.beta);
+  }
+
+  resp->completed = _voxel_grid->AddObject(
+    static_cast<uint32_t>(req->id), req->object_name, affordances);
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::QueryObjectCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::QueryObject::Request> req,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::QueryObject::Response> resp)
+/*****************************************************************************/
+{
+  boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+
+  if (!_voxel_grid || req->id <= 0) {
+    resp->completed = false;
+    return;
+  }
+
+  volume_grid::ObjectInstance object;
+  resp->completed = _voxel_grid->GetObject(static_cast<uint32_t>(req->id), object);
+  if (!resp->completed) {
+    return;
+  }
+
+  resp->id = static_cast<int32_t>(object.id);
+  resp->object_name = object.name;
+  resp->affordances.reserve(object.alpha_beta_values.size());
+
+  for (const auto & affordance : object.alpha_beta_values) {
+    spatio_temporal_voxel_layer::msg::Affordance affordance_msg;
+    affordance_msg.affordance_name = affordance.first;
+    affordance_msg.alpha = affordance.second.first;
+    affordance_msg.beta = affordance.second.second;
+    resp->affordances.push_back(affordance_msg);
+  }
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelLayer::UpdateObjectCallback(
+  const std::shared_ptr<rmw_request_id_t>/*header*/,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::UpdateObject::Request> req,
+  std::shared_ptr<spatio_temporal_voxel_layer::srv::UpdateObject::Response> resp)
+/*****************************************************************************/
+{
+  boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+
+  if (!_voxel_grid || req->id <= 0) {
+    resp->completed = false;
+    return;
+  }
+
+  resp->completed = _voxel_grid->UpdateObject(
+    static_cast<uint32_t>(req->id), req->affordance_names, req->alphas, req->betas);
 }
 
 rcl_interfaces::msg::SetParametersResult
@@ -1009,17 +1032,6 @@ SpatioTemporalVoxelLayer::dynamicParametersCallback(std::vector<rclcpp::Paramete
     if (type == ParameterType::PARAMETER_INTEGER) {
       if (name == name_ + "." + "mark_threshold") {
         _mark_threshold = parameter.as_int();
-      }
-    }
-
-    if (type == ParameterType::PARAMETER_DOUBLE) {
-      if (name == name_ + "." + "occupied_threshold") {
-        const double clamped = std::max(0.0, std::min(1.0, parameter.as_double()));
-        _occupied_threshold = clamped;
-        if (_voxel_grid) {
-          boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
-          _voxel_grid->SetOccupiedThreshold(_occupied_threshold);
-        }
       }
     }
   }

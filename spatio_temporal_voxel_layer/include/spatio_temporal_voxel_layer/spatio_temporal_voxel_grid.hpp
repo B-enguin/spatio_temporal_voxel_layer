@@ -119,6 +119,16 @@ struct frustum_model
   const double accel_factor;
 };
 
+struct ObjectInstance
+{
+  using AlphaBetaPair = std::pair<float, float>;
+
+  uint32_t id{0u};
+  std::string name;
+  std::unordered_map<std::string, AlphaBetaPair> alpha_beta_values;
+  float max_affordance_mean{0.0f};
+};
+
 // Core voxel grid structure and interface
 class SpatioTemporalVoxelGrid
 {
@@ -131,8 +141,7 @@ public:
     rclcpp::Clock::SharedPtr clock,
     const float & voxel_size, const double & background_value,
     const int & decay_model, const double & voxel_decay,
-    const bool & pub_voxels, const uint32_t & max_affordances,
-    const double & afforded_factor, const double & occupied_threshold);
+    const bool & pub_voxels);
   ~SpatioTemporalVoxelGrid(void);
 
   // Core making and clearing functions
@@ -144,8 +153,7 @@ public:
 
   // Get the pointcloud of the underlying occupancy grid
   void GetOccupancyPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
-  void GetSemanticPointCloud(std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2);
-  std::unordered_map<occupany_cell, std::pair<uint, float>> * GetFlattenedCostmap();
+  std::unordered_map<occupany_cell, uint> * GetFlattenedCostmap();
 
   // Clear the grid
   bool ResetGrid(void);
@@ -153,8 +161,13 @@ public:
 
   // Save the file to file with size information
   bool SaveGrid(const std::string & file_name, double & map_size_bytes);
-
-  void SetOccupiedThreshold(const double & occupied_threshold);
+  bool AddObject(
+    const uint32_t id, const std::string & name,
+    const std::unordered_map<std::string, ObjectInstance::AlphaBetaPair> & affordances);
+  bool GetObject(const uint32_t id, ObjectInstance & object) const;
+  bool UpdateObject(
+    const uint32_t id, const std::vector<std::string> & affordance_names,
+    const std::vector<float> & alphas, const std::vector<float> & betas);
 
 protected:
   // Initialize grid metadata and library
@@ -166,10 +179,10 @@ protected:
 
   // Check occupancy status of the grid
   bool IsGridEmpty(void) const;
+  float GetOccupancyThreshold(void) const;
 
   // Get time information for clearing
   double GetTemporalClearingDuration(const double & time_delta);
-  bool HasAffordances(const openvdb::Vec3d & value) const;
   double GetFrustumAcceleration(
     const double & time_delta, const double & acceleration_factor);
   void TemporalClearAndGenerateCostmap(
@@ -177,7 +190,7 @@ protected:
     std::unordered_set<occupany_cell> & cleared_cells);
 
   // Populate the costmap ROS api and pointcloud with a marked point
-  void PopulateCostmapAndPointcloud(const openvdb::Coord & pt);
+  void PopulateCostmapAndPointcloud(const openvdb::Coord & pt, const float occupancy_threshold);
 
   // Utilities for tranformation
   openvdb::Vec3d WorldToIndex(const openvdb::Vec3d & coord) const;
@@ -185,25 +198,19 @@ protected:
 
   // Payload convention:
   // value[0] = timestamp
-  // value[1] = object id (stored as double)
-  // value[2] = occupancy likelihood [0.0, 1.0]
+  // value[1] = object id
+  // value[2] = occupancy [0, 255]
 
   rclcpp::Clock::SharedPtr _clock;
 
-  mutable openvdb::Vec3dGrid::Ptr _grid;
+  mutable openvdb::Vec3fGrid::Ptr _grid;
   int _decay_model;
   double _background_value, _voxel_size, _voxel_decay;
   bool _pub_voxels;
   std::unique_ptr<std::vector<geometry_msgs::msg::Point32>> _grid_points;
-  std::unordered_map<occupany_cell, std::pair<uint, float>> * _cost_map;
-
-  // Dynamic affordance storage keyed by object id.
-  std::unordered_map<uint64_t, std::vector<double>> _affordance_map;
-  uint32_t _max_affordances;
-  double _afforded_factor;
-  double _occupied_threshold;
-
-  boost::mutex _grid_lock;
+  std::unordered_map<occupany_cell, uint> * _cost_map;
+  std::unordered_map<uint32_t, ObjectInstance> _objects;
+  mutable boost::mutex _grid_lock;
 };
 
 }  // namespace volume_grid

@@ -1,0 +1,6 @@
+int32 id
+string[] affordance_names
+float32[] alphas
+float32[] betas
+---
+bool completed

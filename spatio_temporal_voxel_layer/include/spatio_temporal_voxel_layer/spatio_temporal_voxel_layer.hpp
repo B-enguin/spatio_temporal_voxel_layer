@@ -66,7 +66,11 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "geometry_msgs/msg/point.hpp"
+#include "spatio_temporal_voxel_layer/msg/affordance.hpp"
+#include "spatio_temporal_voxel_layer/srv/add_object.hpp"
+#include "spatio_temporal_voxel_layer/srv/query_object.hpp"
 #include "spatio_temporal_voxel_layer/srv/save_grid.hpp"
+#include "spatio_temporal_voxel_layer/srv/update_object.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 // projector
 #include "laser_geometry/laser_geometry.hpp"
@@ -133,6 +137,18 @@ public:
     const std::shared_ptr<rmw_request_id_t>/*header*/,
     std::shared_ptr<spatio_temporal_voxel_layer::srv::SaveGrid::Request> req,
     std::shared_ptr<spatio_temporal_voxel_layer::srv::SaveGrid::Response> resp);
+  void AddObjectCallback(
+    const std::shared_ptr<rmw_request_id_t>/*header*/,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::AddObject::Request> req,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::AddObject::Response> resp);
+  void QueryObjectCallback(
+    const std::shared_ptr<rmw_request_id_t>/*header*/,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::QueryObject::Request> req,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::QueryObject::Response> resp);
+  void UpdateObjectCallback(
+    const std::shared_ptr<rmw_request_id_t>/*header*/,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::UpdateObject::Request> req,
+    std::shared_ptr<spatio_temporal_voxel_layer::srv::UpdateObject::Response> resp);
 
 private:
   // Sensor callbacks
@@ -177,15 +193,15 @@ private:
 
   bool _publish_voxels, _mapping_mode, was_reset_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _voxel_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _voxel_semantics_pub;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr _voxel_affordance_pub;
   rclcpp::Service<spatio_temporal_voxel_layer::srv::SaveGrid>::SharedPtr _grid_saver;
+  rclcpp::Service<spatio_temporal_voxel_layer::srv::AddObject>::SharedPtr _object_adder;
+  rclcpp::Service<spatio_temporal_voxel_layer::srv::QueryObject>::SharedPtr _object_query;
+  rclcpp::Service<spatio_temporal_voxel_layer::srv::UpdateObject>::SharedPtr _object_updater;
   std::unique_ptr<rclcpp::Duration> _map_save_duration;
   rclcpp::Time _last_map_save_time;
   std::string _global_frame;
-  double _voxel_size, _voxel_decay, _afforded_factor, _occupied_threshold;
+  double _voxel_size, _voxel_decay;
   int _combination_method, _mark_threshold;
-  uint32_t _max_affordances;
   volume_grid::GlobalDecayModel _decay_model;
   bool _update_footprint_enabled, _enabled;
   std::vector<geometry_msgs::msg::Point> _transformed_footprint;

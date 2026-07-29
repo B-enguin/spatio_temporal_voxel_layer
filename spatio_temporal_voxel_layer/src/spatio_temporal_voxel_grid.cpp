@@ -39,14 +39,13 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
-#include <cstring>
-#include <cmath>
 #include <algorithm>
-#include <array>
-#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
+#include "nav2_costmap_2d/cost_values.hpp"
 #include "spatio_temporal_voxel_layer/spatio_temporal_voxel_grid.hpp"
 
 namespace volume_grid
@@ -54,65 +53,139 @@ namespace volume_grid
 
 namespace
 {
-inline uint64_t ToIdKey(const float value)
+constexpr float MIN_OCCUPANCY = 0.0f;
+constexpr float MAX_OCCUPANCY = 255.0f;
+constexpr float OCCUPANCY_MARK_INCREMENT = 1.0f;
+constexpr float OCCUPANCY_FRUSTUM_DECREMENT = 0.1f;
+constexpr float MIN_OCCUPANCY_THRESHOLD = 5.0f;
+constexpr float MIN_AFFORDANCE_MEAN = 0.0f;
+constexpr float MAX_AFFORDANCE_MEAN = 1.0f;
+
+inline float ClampOccupancy(const float value)
 {
-  const float clamped = std::max(0.0f, std::min(static_cast<float>(std::numeric_limits<uint64_t>::max()), value));
-  return static_cast<uint64_t>(std::llround(static_cast<double>(clamped)));
+  return std::max(MIN_OCCUPANCY, std::min(MAX_OCCUPANCY, value));
 }
 
-inline uint64_t ToIdKey(const double value)
+inline float ClampAffordanceMean(const float value)
 {
-  const double clamped = std::max(0.0, std::min(static_cast<double>(std::numeric_limits<uint64_t>::max()), value));
-  return static_cast<uint64_t>(std::llround(clamped));
+  return std::max(MIN_AFFORDANCE_MEAN, std::min(MAX_AFFORDANCE_MEAN, value));
 }
 
-inline bool IsAffordanceField(const std::string & name)
+float ComputeMaxAffordanceMean(
+  const std::unordered_map<std::string, ObjectInstance::AlphaBetaPair> & affordances)
 {
-  return name.rfind("affordance", 0) == 0 && name != "affordance_count";
-}
-
-inline double Clamp01(const double value)
-{
-  return std::max(0.0, std::min(1.0, value));
-}
-
-inline int ParseAffordanceIndex(const std::string & name, const int fallback)
-{
-  std::size_t end = name.size();
-  std::size_t start = end;
-  while (start > 0 && std::isdigit(static_cast<unsigned char>(name[start - 1]))) {
-    --start;
-  }
-  if (start == end) {
-    return fallback;
-  }
-  return std::stoi(name.substr(start, end - start));
-}
-
-inline std::vector<std::string> GetOrderedAffordanceFields(
-  const sensor_msgs::msg::PointCloud2 & cloud)
-{
-  std::vector<std::pair<int, std::string>> indexed_fields;
-  int fallback = 1000;
-  for (const auto & field : cloud.fields) {
-    if (!IsAffordanceField(field.name)) {
+  float max_mean = MIN_AFFORDANCE_MEAN;
+  for (const auto & affordance : affordances) {
+    const float alpha = affordance.second.first;
+    const float beta = affordance.second.second;
+    const float denominator = alpha + beta;
+    if (denominator <= 0.0f) {
       continue;
     }
-    indexed_fields.emplace_back(ParseAffordanceIndex(field.name, fallback++), field.name);
+    max_mean = std::max(max_mean, ClampAffordanceMean(alpha / denominator));
+  }
+  return max_mean;
+}
+
+uint GetObjectCost(const uint32_t object_id, const std::unordered_map<uint32_t, ObjectInstance> & objects)
+{
+  if (object_id == 0u) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
   }
 
-  std::sort(
-    indexed_fields.begin(), indexed_fields.end(),
-    [](const auto & a, const auto & b) {
-      return (a.first == b.first) ? (a.second < b.second) : (a.first < b.first);
-    });
-
-  std::vector<std::string> out;
-  out.reserve(indexed_fields.size());
-  for (const auto & it : indexed_fields) {
-    out.push_back(it.second);
+  float max_mean = MIN_AFFORDANCE_MEAN;
+  const auto object_it = objects.find(object_id);
+  if (object_it != objects.end()) {
+    max_mean = object_it->second.max_affordance_mean;
   }
-  return out;
+
+  const float scaled_cost = static_cast<float>(nav2_costmap_2d::LETHAL_OBSTACLE) *
+    (1.0f - ClampAffordanceMean(max_mean));
+  return static_cast<uint>(std::lround(ClampOccupancy(scaled_cost)));
+}
+
+inline uint32_t ToObjectId(const float value)
+{
+  if (!std::isfinite(value)) {
+    return 0u;
+  }
+
+  const float clamped = std::max(
+    0.0f, std::min(static_cast<float>(std::numeric_limits<uint32_t>::max()), value));
+  return static_cast<uint32_t>(std::lround(clamped));
+}
+
+inline uint32_t ToObjectId(const double value)
+{
+  if (!std::isfinite(value)) {
+    return 0u;
+  }
+
+  const double clamped = std::max(
+    0.0, std::min(static_cast<double>(std::numeric_limits<uint32_t>::max()), value));
+  return static_cast<uint32_t>(std::llround(clamped));
+}
+
+inline std::string ObjectName(const uint32_t id)
+{
+  return "object_" + std::to_string(id);
+}
+
+const sensor_msgs::msg::PointField * FindField(
+  const sensor_msgs::msg::PointCloud2 & cloud, const std::string & name)
+{
+  for (const auto & field : cloud.fields) {
+    if (field.name == name) {
+      return &field;
+    }
+  }
+  return nullptr;
+}
+
+template<typename T>
+T ReadFieldValue(const sensor_msgs::msg::PointCloud2 & cloud, const std::size_t offset)
+{
+  T value{};
+  if (offset + sizeof(T) <= cloud.data.size()) {
+    std::memcpy(&value, &cloud.data[offset], sizeof(T));
+  }
+  return value;
+}
+
+uint32_t ReadObjectId(
+  const sensor_msgs::msg::PointCloud2 & cloud,
+  const sensor_msgs::msg::PointField * field,
+  const std::size_t point_index)
+{
+  if (!field) {
+    return 0u;
+  }
+
+  const std::size_t offset = (point_index * cloud.point_step) + field->offset;
+  if (offset >= cloud.data.size()) {
+    return 0u;
+  }
+
+  switch (field->datatype) {
+    case sensor_msgs::msg::PointField::INT8:
+      return ToObjectId(static_cast<double>(ReadFieldValue<int8_t>(cloud, offset)));
+    case sensor_msgs::msg::PointField::UINT8:
+      return static_cast<uint32_t>(ReadFieldValue<uint8_t>(cloud, offset));
+    case sensor_msgs::msg::PointField::INT16:
+      return ToObjectId(static_cast<double>(ReadFieldValue<int16_t>(cloud, offset)));
+    case sensor_msgs::msg::PointField::UINT16:
+      return static_cast<uint32_t>(ReadFieldValue<uint16_t>(cloud, offset));
+    case sensor_msgs::msg::PointField::INT32:
+      return ToObjectId(static_cast<double>(ReadFieldValue<int32_t>(cloud, offset)));
+    case sensor_msgs::msg::PointField::UINT32:
+      return ReadFieldValue<uint32_t>(cloud, offset);
+    case sensor_msgs::msg::PointField::FLOAT32:
+      return ToObjectId(ReadFieldValue<float>(cloud, offset));
+    case sensor_msgs::msg::PointField::FLOAT64:
+      return ToObjectId(ReadFieldValue<double>(cloud, offset));
+    default:
+      return 0u;
+  }
 }
 }  // namespace
 
@@ -120,17 +193,12 @@ inline std::vector<std::string> GetOrderedAffordanceFields(
 SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
   rclcpp::Clock::SharedPtr clock,
   const float & voxel_size, const double & background_value,
-  const int & decay_model, const double & voxel_decay, const bool & pub_voxels,
-  const uint32_t & max_affordances, const double & afforded_factor,
-  const double & occupied_threshold)
+  const int & decay_model, const double & voxel_decay, const bool & pub_voxels)
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
   _voxel_size(voxel_size), _voxel_decay(voxel_decay), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
-  _cost_map(new std::unordered_map<occupany_cell, std::pair<uint, float>>),
-  _affordance_map(std::unordered_map<uint64_t, std::vector<double>>()),
-  _max_affordances(max_affordances),
-  _afforded_factor(std::max(0.0, afforded_factor)),
-  _occupied_threshold(Clamp01(occupied_threshold))
+  _cost_map(new std::unordered_map<occupany_cell, uint>),
+  _objects(std::unordered_map<uint32_t, ObjectInstance>())
 /*****************************************************************************/
 {
   this->InitializeGrid();
@@ -154,7 +222,8 @@ void SpatioTemporalVoxelGrid::InitializeGrid(void)
   openvdb::initialize();
 
   // make it default to background value
-  _grid = openvdb::Vec3dGrid::create(openvdb::Vec3d(_background_value, 0.0, 0.0));
+  _grid = openvdb::Vec3fGrid::create(
+    openvdb::Vec3f(static_cast<float>(_background_value), 0.0f, 0.0f));
 
   // setup scale and tranform
   openvdb::Mat4d m = openvdb::Mat4d::identity();
@@ -230,9 +299,10 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 {
   // sample time once for all clearing readings
   const double cur_time = _clock->now().seconds();
+  openvdb::Vec3fGrid::Accessor accessor = _grid->getAccessor();
 
   // check each point in the grid for inclusion in a frustum
-  openvdb::Vec3dGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
+  openvdb::Vec3fGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
   for (; cit_grid.test(); ++cit_grid) {
     const openvdb::Coord pt_index(cit_grid.getCoord());
     const openvdb::Vec3d pose_world = this->IndexToWorld(pt_index);
@@ -242,10 +312,8 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
     bool cleared_point = false;
 
     const double time_since_marking = cur_time - cit_grid.getValue()[0];
-    double base_duration_to_decay = GetTemporalClearingDuration(time_since_marking);
-    if (HasAffordances(cit_grid.getValue())) {
-      base_duration_to_decay *= _afforded_factor;
-    }
+    const double base_duration_to_decay = GetTemporalClearingDuration(
+      time_since_marking);
 
     for (; frustum_it != frustums.end(); ++frustum_it) {
       if (!frustum_it->frustum) {
@@ -254,26 +322,20 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 
       if (frustum_it->frustum->IsInside(pose_world) ) {
         frustum_cycle = true;
+        openvdb::Vec3f updated_value = accessor.getValue(pt_index);
+        updated_value[2] = ClampOccupancy(updated_value[2] - OCCUPANCY_FRUSTUM_DECREMENT);
+        accessor.setValueOn(pt_index, updated_value);
 
         const double frustum_acceleration = GetFrustumAcceleration(
           time_since_marking, frustum_it->accel_factor);
 
         const double time_until_decay = base_duration_to_decay -
           frustum_acceleration;
-
-        const openvdb::Vec3d cur_value = cit_grid.getValue();
-        const double updated_occupancy = 0.5 * Clamp01(cur_value[2]);
-
         if (time_until_decay < 0.) {
-          // accelerated temporal decay and lower occupancy confidence
-          const double updated_mark = cur_time - _voxel_decay;
-          if (!this->MarkGridPoint(pt_index, updated_mark)) {
-            std::cout << "Failed to update mark." << std::endl;
-          } else {
-            openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
-            openvdb::Vec3d updated_value = accessor.getValue(pt_index);
-            updated_value[2] = updated_occupancy;
-            accessor.setValueOn(pt_index, updated_value);
+          // expired by acceleration
+          cleared_point = true;
+          if (!this->ClearGridPoint(pt_index)) {
+            std::cout << "Failed to clear point." << std::endl;
           }
           break;
         } else {
@@ -281,11 +343,6 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
             frustum_acceleration;
           if (!this->MarkGridPoint(pt_index, updated_mark)) {
             std::cout << "Failed to update mark." << std::endl;
-          } else {
-            openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
-            openvdb::Vec3d updated_value = accessor.getValue(pt_index);
-            updated_value[2] = updated_occupancy;
-            accessor.setValueOn(pt_index, updated_value);
           }
           break;
         }
@@ -306,39 +363,27 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
     if (cleared_point)
     {
       cleared_cells.insert(occupany_cell(pose_world[0], pose_world[1]));
-    } else {
-      // if here, we can add to costmap and PC2
-      PopulateCostmapAndPointcloud(pt_index);
     }
   }
 
   // free memory taken by expired voxels
   _grid->pruneGrid();
-}
 
-/*****************************************************************************/
-bool SpatioTemporalVoxelGrid::HasAffordances(const openvdb::Vec3d & value) const
-/*****************************************************************************/
-{
-  const uint64_t id = ToIdKey(value[1]);
-  if (id == 0u) {
-    return false;
+  const float occupancy_threshold = GetOccupancyThreshold();
+  for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
+    PopulateCostmapAndPointcloud(it.getCoord(), occupancy_threshold);
   }
-
-  const auto affordance_it = _affordance_map.find(id);
-  return affordance_it != _affordance_map.end() && !affordance_it->second.empty();
 }
 
 /*****************************************************************************/
 void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
-  const openvdb::Coord & pt)
+  const openvdb::Coord & pt, const float occupancy_threshold)
 /*****************************************************************************/
 {
   // add pt to the pointcloud and costmap
-  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
-  openvdb::Vec3d value = accessor.getValue(pt);
-
-  if (Clamp01(value[2]) <= _occupied_threshold) {
+  openvdb::Vec3fGrid::Accessor accessor = _grid->getAccessor();
+  const openvdb::Vec3f value = accessor.getValue(pt);
+  if (value[2] <= occupancy_threshold) {
     return;
   }
 
@@ -352,38 +397,17 @@ void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
     _grid_points->push_back(point);
   }
 
-  const uint64_t id_key = ToIdKey(value[1]);
-  float affordance = 0.0f;
-  const auto id_it = _affordance_map.find(id_key);
-  if (id_it != _affordance_map.end()) {
-    for (const auto a : id_it->second) {
-      affordance = std::max(affordance, static_cast<float>(a));
-    }
-  }
+  const uint32_t object_id = ToObjectId(value[1]);
+  const uint voxel_cost = GetObjectCost(object_id, _objects);
+  const occupany_cell map_cell(pose_world[0], pose_world[1]);
 
-  std::unordered_map<occupany_cell, std::pair<uint, float>>::iterator cell;
-  cell = _cost_map->find(occupany_cell(pose_world[0], pose_world[1]));
+  std::unordered_map<occupany_cell, uint>::iterator cell;
+  cell = _cost_map->find(map_cell);
   if (cell != _cost_map->end()) {
-    cell->second.first += 1;
-
-    if (affordance > cell->second.second) {
-      cell->second.second = affordance;
-    }
+    cell->second = std::max(cell->second, voxel_cost);
   } else {
-    _cost_map->insert(
-      std::make_pair(
-        occupany_cell(pose_world[0], pose_world[1]), std::make_pair(1, affordance)));
+    _cost_map->insert(std::make_pair(map_cell, voxel_cost));
   }
-
-  // if (id_key != 0u && !affordances.empty()) {
-  //   auto & stored = _affordance_map[id_key];
-  //   if (stored.size() < affordances.size()) {
-  //     stored.resize(affordances.size(), 0.0);
-  //   }
-  //   for (std::size_t i = 0; i < affordances.size(); ++i) {
-  //     stored[i] = std::max(stored[i], affordances[i]);
-  //   }
-  // }
 }
 
 /*****************************************************************************/
@@ -415,104 +439,62 @@ void SpatioTemporalVoxelGrid::operator()(
     sensor_msgs::PointCloud2ConstIterator<float> iter_y(cloud, "y");
     sensor_msgs::PointCloud2ConstIterator<float> iter_z(cloud, "z");
 
-    bool has_id = false;
-    std::string id_field_name;
-    for (const auto & field : cloud.fields) {
-      if (field.name == "id") {
-        has_id = true;
-        id_field_name = field.name;
-        break;
+    const sensor_msgs::msg::PointField * object_id_field = FindField(cloud, "id");
+    if (!object_id_field) {
+      object_id_field = FindField(cloud, "object_id");
+    }
+
+    std::size_t point_index = 0u;
+    for (; iter_x != iter_x.end();
+      ++iter_x, ++iter_y, ++iter_z, ++point_index)
+    {
+      const uint32_t object_id = ReadObjectId(cloud, object_id_field, point_index);
+      const float object_id_value = static_cast<float>(object_id);
+
+      float distance_2 =
+        (*iter_x - obs._origin.x) * (*iter_x - obs._origin.x) +
+        (*iter_y - obs._origin.y) * (*iter_y - obs._origin.y) +
+        (*iter_z - obs._origin.z) * (*iter_z - obs._origin.z);
+      if (distance_2 > mark_range_2 || distance_2 < 0.0001) {
+        continue;
       }
-    }
 
-    std::vector<std::string> affordance_fields = GetOrderedAffordanceFields(cloud);
-    if (_max_affordances > 0u && affordance_fields.size() > _max_affordances) {
-      std::cout << "Received " << affordance_fields.size()
-                << " affordance fields; using first " << _max_affordances << "." << std::endl;
-      affordance_fields.resize(_max_affordances);
-    }
+      double x = *iter_x < 0 ? *iter_x - _voxel_size : *iter_x;
+      double y = *iter_y < 0 ? *iter_y - _voxel_size : *iter_y;
+      double z = *iter_y < 0 ? *iter_z - _voxel_size : *iter_z;
 
-    std::vector<sensor_msgs::PointCloud2ConstIterator<float>> iter_affordances;
-    iter_affordances.reserve(affordance_fields.size());
-    for (const auto & name : affordance_fields) {
-      iter_affordances.emplace_back(cloud, name);
-    }
+      openvdb::Vec3d mark_grid(this->WorldToIndex(
+          openvdb::Vec3d(x, y, z)));
 
-    std::unique_ptr<sensor_msgs::PointCloud2ConstIterator<float>> iter_id;
-    if (has_id) {
-      iter_id =
-        std::make_unique<sensor_msgs::PointCloud2ConstIterator<float>>(cloud, id_field_name);
-    }
-
-    openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
-
-    auto update_voxel =
-      [&](const float px, const float py, const float pz,
-      const uint64_t id_key, const std::vector<double> & affordances)
+      const openvdb::Coord coord(mark_grid[0], mark_grid[1], mark_grid[2]);
+      if (!this->MarkGridPoint(coord, cur_time))
       {
-        const float distance_2 =
-          (px - obs._origin.x) * (px - obs._origin.x) +
-          (py - obs._origin.y) * (py - obs._origin.y) +
-          (pz - obs._origin.z) * (pz - obs._origin.z);
-
-        if (distance_2 > mark_range_2 || distance_2 < 0.0001f) {
-          return;
-        }
-
-        const double x = px < 0 ? px - _voxel_size : px;
-        const double y = py < 0 ? py - _voxel_size : py;
-        const double z = pz < 0 ? pz - _voxel_size : pz;
-
-        const openvdb::Vec3d mark_grid = this->WorldToIndex(openvdb::Vec3d(x, y, z));
-        const openvdb::Coord coord(mark_grid[0], mark_grid[1], mark_grid[2]);
-
-        openvdb::Vec3d value = accessor.isValueOn(coord) ?
-          accessor.getValue(coord) :
-          openvdb::Vec3d(_background_value, 0.0, 0.0);
-
-        const double existing_occupancy = Clamp01(value[2]);
-
-        // Use id_key is non-zero, otherwise preserve existing id if present
-        value[0] = cur_time;
-        if (id_key != 0u) {
-          value[1] = static_cast<double>(id_key);
-        }
-        value[2] = 0.5 * (existing_occupancy + 1.0);
-        
-        accessor.setValueOn(coord, value);
-
-        if (id_key != 0u && !affordances.empty()) {
-          auto & stored = _affordance_map[id_key];
-          if (stored.size() < affordances.size()) {
-            stored.resize(affordances.size(), 0.0);
-          }
-          for (std::size_t i = 0; i < affordances.size(); ++i) {
-            stored[i] = std::max(stored[i], affordances[i]);
-          }
-        }
-      } ;
-
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
-      uint64_t id_value = 0u;
-      if (iter_id) {
-        id_value = ToIdKey(**iter_id);
-        ++(*iter_id);
+        std::cout << "Failed to mark point." << std::endl;
+        continue;
       }
 
-      std::vector<double> point_affordances;
-      point_affordances.reserve(iter_affordances.size());
-      for (auto & it : iter_affordances) {
-        point_affordances.push_back(static_cast<double>(*it));
-        ++it;
-      }
+      openvdb::Vec3fGrid::Accessor accessor = _grid->getAccessor();
+      openvdb::Vec3f value = accessor.getValue(coord);
+      value[2] = ClampOccupancy(value[2] + OCCUPANCY_MARK_INCREMENT);
 
-      update_voxel(*iter_x, *iter_y, *iter_z, id_value, point_affordances);
+      // A zero incoming id means "unknown"; keep the voxel's current object id.
+      if (object_id != 0u) {
+        value[1] = object_id_value;
+
+        ObjectInstance & object = _objects[object_id];
+        if (object.name.empty()) {
+          object.id = object_id;
+          object.name = ObjectName(object_id);
+          object.max_affordance_mean = MIN_AFFORDANCE_MEAN;
+        }
+      }
+      accessor.setValueOn(coord, value);
     }
   }
 }
 
 /*****************************************************************************/
-std::unordered_map<occupany_cell, std::pair<uint, float>> *
+std::unordered_map<occupany_cell, uint> *
 SpatioTemporalVoxelGrid::GetFlattenedCostmap()
 /*****************************************************************************/
 {
@@ -548,78 +530,17 @@ void SpatioTemporalVoxelGrid::GetOccupancyPointCloud(
   std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2)
 /*****************************************************************************/
 {
-  // convert the grid points stored in a PointCloud2
-  pc2->width = _grid_points->size();
-  pc2->height = 1;
-  pc2->is_dense = true;
-
-  sensor_msgs::PointCloud2Modifier modifier(*pc2);
-
-  modifier.setPointCloud2Fields(
-    3,
-    "x", 1, sensor_msgs::msg::PointField::FLOAT32,
-    "y", 1, sensor_msgs::msg::PointField::FLOAT32,
-    "z", 1, sensor_msgs::msg::PointField::FLOAT32);
-  modifier.setPointCloud2FieldsByString(1, "xyz");
-
-  sensor_msgs::PointCloud2Iterator<float> iter_x(*pc2, "x");
-  sensor_msgs::PointCloud2Iterator<float> iter_y(*pc2, "y");
-  sensor_msgs::PointCloud2Iterator<float> iter_z(*pc2, "z");
-
-  for (std::vector<geometry_msgs::msg::Point32>::iterator it =
-    _grid_points->begin();
-    it != _grid_points->end(); ++it)
-  {
-    const geometry_msgs::msg::Point32 & pt = *it;
-    *iter_x = pt.x;
-    *iter_y = pt.y;
-    *iter_z = pt.z;
-    ++iter_x; ++iter_y; ++iter_z;
-  }
-}
-
-/*****************************************************************************/
-void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
-  std::unique_ptr<sensor_msgs::msg::PointCloud2> & pc2)
-/*****************************************************************************/
-{
-  boost::unique_lock<boost::mutex> lock(_grid_lock);
-
-  std::vector<openvdb::Vec3d> points;
-  std::vector<float> ids;
-  std::vector<std::vector<float>> affordances_per_point;
-  std::size_t max_affordances = 0;
-
+  // convert the active occupied VDB voxels into a PointCloud2
+  const float occupancy_threshold = GetOccupancyThreshold();
+  std::vector<std::pair<openvdb::Vec3d, float>> points;
   points.reserve(_grid->activeVoxelCount());
-  ids.reserve(_grid->activeVoxelCount());
-  affordances_per_point.reserve(_grid->activeVoxelCount());
 
-  for (openvdb::Vec3dGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
-    const openvdb::Vec3d value = it.getValue();
-    const uint64_t id = ToIdKey(value[1]);
-    const float is_occupied = static_cast<float>(Clamp01(value[2]));
-
-    if (is_occupied <= _occupied_threshold) {
+  for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
+    const openvdb::Vec3f value = it.getValue();
+    if (value[2] <= occupancy_threshold) {
       continue;
     }
-
-    std::vector<float> affordances;
-    auto a_it = _affordance_map.find(id);
-    if (a_it != _affordance_map.end()) {
-      affordances.reserve(a_it->second.size());
-      for (const auto v : a_it->second) {
-        affordances.push_back(static_cast<float>(v));
-      }
-    }
-
-    if (id == 0u && affordances.empty()) {
-      continue;
-    }
-
-    max_affordances = std::max(max_affordances, affordances.size());
-    points.push_back(IndexToWorld(it.getCoord()));
-    ids.push_back(static_cast<float>(id));
-    affordances_per_point.push_back(std::move(affordances));
+    points.emplace_back(IndexToWorld(it.getCoord()), value[1]);
   }
 
   pc2->width = points.size();
@@ -627,56 +548,29 @@ void SpatioTemporalVoxelGrid::GetSemanticPointCloud(
   pc2->is_dense = true;
   pc2->is_bigendian = false;
 
-  pc2->fields.clear();
-  pc2->fields.reserve(5 + max_affordances);
+  sensor_msgs::PointCloud2Modifier modifier(*pc2);
 
-  auto add_field = [&](const std::string & name, uint32_t offset) {
-    sensor_msgs::msg::PointField f;
-    f.name = name;
-    f.offset = offset;
-    f.datatype = sensor_msgs::msg::PointField::FLOAT32;
-    f.count = 1;
-    pc2->fields.push_back(f);
-  };
+  modifier.setPointCloud2Fields(
+    4,
+    "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+    "id", 1, sensor_msgs::msg::PointField::FLOAT32);
+  modifier.resize(points.size());
 
-  uint32_t offset = 0;
-  add_field("x", offset); offset += 4;
-  add_field("y", offset); offset += 4;
-  add_field("z", offset); offset += 4;
-  add_field("id", offset); offset += 4;
-  add_field("affordance_count", offset); offset += 4;
-  for (std::size_t i = 0; i < max_affordances; ++i) {
-    add_field("affordance_" + std::to_string(i), offset);
-    offset += 4;
+  sensor_msgs::PointCloud2Iterator<float> iter_x(*pc2, "x");
+  sensor_msgs::PointCloud2Iterator<float> iter_y(*pc2, "y");
+  sensor_msgs::PointCloud2Iterator<float> iter_z(*pc2, "z");
+  sensor_msgs::PointCloud2Iterator<float> iter_id(*pc2, "id");
+
+  for (const auto & pt : points)
+  {
+    *iter_x = static_cast<float>(pt.first[0]);
+    *iter_y = static_cast<float>(pt.first[1]);
+    *iter_z = static_cast<float>(pt.first[2]);
+    *iter_id = pt.second;
+    ++iter_x; ++iter_y; ++iter_z; ++iter_id;
   }
-
-  pc2->point_step = offset;
-  pc2->row_step = pc2->point_step * pc2->width;
-  pc2->data.assign(pc2->row_step, 0u);
-
-  auto write_f32 = [&](std::size_t base, uint32_t off, float v) {
-    std::memcpy(&pc2->data[base + off], &v, sizeof(float));
-  };
-
-  for (std::size_t i = 0; i < points.size(); ++i) {
-    const std::size_t base = i * pc2->point_step;
-    write_f32(base, 0, static_cast<float>(points[i][0]));
-    write_f32(base, 4, static_cast<float>(points[i][1]));
-    write_f32(base, 8, static_cast<float>(points[i][2]));
-    write_f32(base, 12, ids[i]);
-    write_f32(base, 16, static_cast<float>(affordances_per_point[i].size()));
-    for (std::size_t j = 0; j < affordances_per_point[i].size(); ++j) {
-      write_f32(base, static_cast<uint32_t>(20 + (j * 4)), affordances_per_point[i][j]);
-    }
-  }
-}
-
-/*****************************************************************************/
-void SpatioTemporalVoxelGrid::SetOccupiedThreshold(const double & occupied_threshold)
-/*****************************************************************************/
-{
-  boost::unique_lock<boost::mutex> lock(_grid_lock);
-  _occupied_threshold = Clamp01(occupied_threshold);
 }
 
 /*****************************************************************************/
@@ -685,9 +579,9 @@ bool SpatioTemporalVoxelGrid::ResetGrid(void)
 {
   boost::unique_lock<boost::mutex> lock(_grid_lock);
 
+  // clear the voxel grid
   try {
     _grid->clear();
-    _affordance_map.clear();
     if (this->IsGridEmpty()) {
       return true;
     }
@@ -704,7 +598,7 @@ void SpatioTemporalVoxelGrid::ResetGridArea(
 {
   boost::unique_lock<boost::mutex> lock(_grid_lock);
 
-  openvdb::Vec3dGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
+  openvdb::Vec3fGrid::ValueOnCIter cit_grid = _grid->cbeginValueOn();
   for (cit_grid; cit_grid.test(); ++cit_grid)
   {
     const openvdb::Coord pt_index(cit_grid.getCoord());
@@ -727,14 +621,16 @@ bool SpatioTemporalVoxelGrid::MarkGridPoint(
 /*****************************************************************************/
 {
   // marking the OpenVDB set
-  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3fGrid::Accessor accessor = _grid->getAccessor();
 
-  const openvdb::Vec3d existing =
-    accessor.isValueOn(pt) ? accessor.getValue(pt)
-                           : openvdb::Vec3d(_background_value, 0.0, 0.0);
+  const openvdb::Vec3f existing =
+    accessor.isValueOn(pt) ? accessor.getValue(pt) :
+    openvdb::Vec3f(static_cast<float>(_background_value), 0.0f, 0.0f);
 
-  accessor.setValueOn(pt, openvdb::Vec3d(value, existing[1], existing[2]));
-  return accessor.getValue(pt)[0] == value;
+  accessor.setValueOn(
+    pt,
+    openvdb::Vec3f(static_cast<float>(value), existing[1], existing[2]));
+  return accessor.getValue(pt)[0] == static_cast<float>(value);
 }
 
 /*****************************************************************************/
@@ -742,10 +638,11 @@ bool SpatioTemporalVoxelGrid::ClearGridPoint(const openvdb::Coord & pt) const
 /*****************************************************************************/
 {
   // clearing the OpenVDB set
-  openvdb::Vec3dGrid::Accessor accessor = _grid->getAccessor();
+  openvdb::Vec3fGrid::Accessor accessor = _grid->getAccessor();
 
   if (accessor.isValueOn(pt)) {
-    accessor.setValueOff(pt, openvdb::Vec3d(_background_value, 0.0, 0.0));
+    accessor.setValueOff(
+      pt, openvdb::Vec3f(static_cast<float>(_background_value), 0.0f, 0.0f));
   }
   return !accessor.isValueOn(pt);
 }
@@ -785,6 +682,17 @@ bool SpatioTemporalVoxelGrid::IsGridEmpty(void) const
 }
 
 /*****************************************************************************/
+float SpatioTemporalVoxelGrid::GetOccupancyThreshold(void) const
+/*****************************************************************************/
+{
+  float max_occupancy = MIN_OCCUPANCY;
+  for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
+    max_occupancy = std::max(max_occupancy, ClampOccupancy(it.getValue()[2]));
+  }
+  return std::max(MIN_OCCUPANCY_THRESHOLD, max_occupancy * 0.5f);
+}
+
+/*****************************************************************************/
 bool SpatioTemporalVoxelGrid::SaveGrid(
   const std::string & file_name, double & map_size_bytes)
 /*****************************************************************************/
@@ -801,6 +709,69 @@ bool SpatioTemporalVoxelGrid::SaveGrid(
     return false;
   }
   return false;  // best offense is a good defense
+}
+
+/*****************************************************************************/
+bool SpatioTemporalVoxelGrid::AddObject(
+  const uint32_t id, const std::string & name,
+  const std::unordered_map<std::string, ObjectInstance::AlphaBetaPair> & affordances)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+
+  if (id == 0u) {
+    return false;
+  }
+
+  ObjectInstance object;
+  object.id = id;
+  object.name = name;
+  object.alpha_beta_values = affordances;
+  object.max_affordance_mean = ComputeMaxAffordanceMean(object.alpha_beta_values);
+  _objects[id] = object;
+  return true;
+}
+
+/*****************************************************************************/
+bool SpatioTemporalVoxelGrid::GetObject(
+  const uint32_t id, ObjectInstance & object) const
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+
+  const auto object_it = _objects.find(id);
+  if (object_it == _objects.end()) {
+    return false;
+  }
+
+  object = object_it->second;
+  return true;
+}
+
+/*****************************************************************************/
+bool SpatioTemporalVoxelGrid::UpdateObject(
+  const uint32_t id, const std::vector<std::string> & affordance_names,
+  const std::vector<float> & alphas, const std::vector<float> & betas)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+
+  if (affordance_names.size() != alphas.size() || affordance_names.size() != betas.size()) {
+    return false;
+  }
+
+  const auto object_it = _objects.find(id);
+  if (object_it == _objects.end()) {
+    return false;
+  }
+
+  for (std::size_t i = 0; i < affordance_names.size(); ++i) {
+    object_it->second.alpha_beta_values[affordance_names[i]] =
+      ObjectInstance::AlphaBetaPair(alphas[i], betas[i]);
+  }
+  object_it->second.max_affordance_mean =
+    ComputeMaxAffordanceMean(object_it->second.alpha_beta_values);
+  return true;
 }
 
 }  // namespace volume_grid
