@@ -113,6 +113,7 @@ rgbd_obstacle_layer:
   observation_persistence: 0.0  #seconds
   max_obstacle_height:   2.0    #meters
   mark_threshold:        0      #voxel height
+  occupied_threshold:    5.0    #minimum voxel occupancy
   update_footprint_enabled: true
   combination_method:    1      #1=max, 0=override
   obstacle_range:        3.0    #meters

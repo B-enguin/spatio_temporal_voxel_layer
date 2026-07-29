@@ -77,7 +77,13 @@ set(library_name spatio_temporal_voxel_layer_core)
 
 add_definitions(${EIGEN3_DEFINITIONS})
 
-set(srv_files "srv/SaveGrid.srv")
+set(srv_files
+  "msg/Affordance.msg"
+  "srv/SaveGrid.srv"
+  "srv/AddObject.srv"
+  "srv/QueryObject.srv"
+  "srv/UpdateObject.srv"
+)
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${srv_files}
   DEPENDENCIES builtin_interfaces std_msgs

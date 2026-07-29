@@ -57,7 +57,6 @@ constexpr float MIN_OCCUPANCY = 0.0f;
 constexpr float MAX_OCCUPANCY = 255.0f;
 constexpr float OCCUPANCY_MARK_INCREMENT = 1.0f;
 constexpr float OCCUPANCY_FRUSTUM_DECREMENT = 0.1f;
-constexpr float MIN_OCCUPANCY_THRESHOLD = 5.0f;
 constexpr float MIN_AFFORDANCE_MEAN = 0.0f;
 constexpr float MAX_AFFORDANCE_MEAN = 1.0f;
 
@@ -85,6 +84,38 @@ float ComputeMaxAffordanceMean(
     max_mean = std::max(max_mean, ClampAffordanceMean(alpha / denominator));
   }
   return max_mean;
+}
+
+ObjectInstance::MeanVariancePair ComputeAffordanceMeanVariance(
+  const ObjectInstance::AlphaBetaPair & alpha_beta)
+{
+  const float alpha = alpha_beta.first;
+  const float beta = alpha_beta.second;
+  const float denominator = alpha + beta;
+
+  if (alpha <= 0.0f || beta <= 0.0f || denominator <= 0.0f) {
+    return ObjectInstance::MeanVariancePair(0.0f, 0.0f);
+  }
+
+  const float mean = alpha / denominator;
+  const float variance = (alpha * beta) /
+    (denominator * denominator * (denominator + 1.0f));
+  return ObjectInstance::MeanVariancePair(ClampAffordanceMean(mean), variance);
+}
+
+std::unordered_map<std::string, ObjectInstance::MeanVariancePair>
+ComputeAffordanceMeanVariances(
+  const std::unordered_map<std::string, ObjectInstance::AlphaBetaPair> & affordances)
+{
+  std::unordered_map<std::string, ObjectInstance::MeanVariancePair> mean_variance_values;
+  mean_variance_values.reserve(affordances.size());
+
+  for (const auto & affordance : affordances) {
+    mean_variance_values[affordance.first] =
+      ComputeAffordanceMeanVariance(affordance.second);
+  }
+
+  return mean_variance_values;
 }
 
 uint GetObjectCost(const uint32_t object_id, const std::unordered_map<uint32_t, ObjectInstance> & objects)
@@ -193,9 +224,11 @@ uint32_t ReadObjectId(
 SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
   rclcpp::Clock::SharedPtr clock,
   const float & voxel_size, const double & background_value,
-  const int & decay_model, const double & voxel_decay, const bool & pub_voxels)
+  const int & decay_model, const double & voxel_decay, const bool & pub_voxels,
+  const float & occupied_threshold)
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
-  _voxel_size(voxel_size), _voxel_decay(voxel_decay), _pub_voxels(pub_voxels),
+  _voxel_size(voxel_size), _voxel_decay(voxel_decay),
+  _occupied_threshold(occupied_threshold), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
   _cost_map(new std::unordered_map<occupany_cell, uint>),
   _objects(std::unordered_map<uint32_t, ObjectInstance>())
@@ -689,7 +722,15 @@ float SpatioTemporalVoxelGrid::GetOccupancyThreshold(void) const
   for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
     max_occupancy = std::max(max_occupancy, ClampOccupancy(it.getValue()[2]));
   }
-  return std::max(MIN_OCCUPANCY_THRESHOLD, max_occupancy * 0.5f);
+  return std::max(_occupied_threshold, max_occupancy * 0.5f);
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelGrid::SetOccupiedThreshold(const float occupied_threshold)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+  _occupied_threshold = occupied_threshold;
 }
 
 /*****************************************************************************/
@@ -727,6 +768,8 @@ bool SpatioTemporalVoxelGrid::AddObject(
   object.id = id;
   object.name = name;
   object.alpha_beta_values = affordances;
+  object.mean_variance_values =
+    ComputeAffordanceMeanVariances(object.alpha_beta_values);
   object.max_affordance_mean = ComputeMaxAffordanceMean(object.alpha_beta_values);
   _objects[id] = object;
   return true;
@@ -766,8 +809,10 @@ bool SpatioTemporalVoxelGrid::UpdateObject(
   }
 
   for (std::size_t i = 0; i < affordance_names.size(); ++i) {
-    object_it->second.alpha_beta_values[affordance_names[i]] =
-      ObjectInstance::AlphaBetaPair(alphas[i], betas[i]);
+    const auto alpha_beta = ObjectInstance::AlphaBetaPair(alphas[i], betas[i]);
+    object_it->second.alpha_beta_values[affordance_names[i]] = alpha_beta;
+    object_it->second.mean_variance_values[affordance_names[i]] =
+      ComputeAffordanceMeanVariance(alpha_beta);
   }
   object_it->second.max_affordance_mean =
     ComputeMaxAffordanceMean(object_it->second.alpha_beta_values);

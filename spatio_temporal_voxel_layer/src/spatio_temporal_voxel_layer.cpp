@@ -99,6 +99,9 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   // size of each voxel in meters
   declareParameter("voxel_size", rclcpp::ParameterValue(0.05));
   node->get_parameter(name_ + ".voxel_size", _voxel_size);
+  // minimum occupancy value for a voxel to be treated as occupied
+  declareParameter("occupied_threshold", rclcpp::ParameterValue(5.0));
+  node->get_parameter(name_ + ".occupied_threshold", _occupied_threshold);
   // 1=takes highest in layers, 0=takes current layer
   declareParameter("combination_method", rclcpp::ParameterValue(1));
   node->get_parameter(name_ + ".combination_method", _combination_method);
@@ -174,7 +177,7 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels);
+    _voxel_decay, _publish_voxels, static_cast<float>(_occupied_threshold));
 
   matchSize();
 
@@ -1032,6 +1035,16 @@ SpatioTemporalVoxelLayer::dynamicParametersCallback(std::vector<rclcpp::Paramete
     if (type == ParameterType::PARAMETER_INTEGER) {
       if (name == name_ + "." + "mark_threshold") {
         _mark_threshold = parameter.as_int();
+      }
+    }
+
+    if (type == ParameterType::PARAMETER_DOUBLE) {
+      if (name == name_ + "." + "occupied_threshold") {
+        _occupied_threshold = parameter.as_double();
+        boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+        if (_voxel_grid) {
+          _voxel_grid->SetOccupiedThreshold(static_cast<float>(_occupied_threshold));
+        }
       }
     }
   }
