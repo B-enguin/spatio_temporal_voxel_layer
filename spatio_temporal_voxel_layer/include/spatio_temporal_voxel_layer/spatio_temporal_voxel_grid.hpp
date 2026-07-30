@@ -143,7 +143,9 @@ public:
     rclcpp::Clock::SharedPtr clock,
     const float & voxel_size, const double & background_value,
     const int & decay_model, const double & voxel_decay,
-    const bool & pub_voxels, const float & occupied_threshold);
+    const bool & pub_voxels, const float & occupied_threshold,
+    const float & cost_min_thresh, const float & cost_max_thresh,
+    const float & regular_decay, const float & frustum_decay);
   ~SpatioTemporalVoxelGrid(void);
 
   // Core making and clearing functions
@@ -171,6 +173,10 @@ public:
     const uint32_t id, const std::vector<std::string> & affordance_names,
     const std::vector<float> & alphas, const std::vector<float> & betas);
   void SetOccupiedThreshold(const float occupied_threshold);
+  void SetCostThresholds(
+    const float cost_min_thresh, const float cost_max_thresh);
+  void SetRegularDecay(const float regular_decay);
+  void SetFrustumDecay(const float frustum_decay);
 
 protected:
   // Initialize grid metadata and library
@@ -209,7 +215,8 @@ protected:
   mutable openvdb::Vec3fGrid::Ptr _grid;
   int _decay_model;
   double _background_value, _voxel_size, _voxel_decay;
-  float _occupied_threshold;
+  float _occupied_threshold, _cost_min_thresh, _cost_max_thresh;
+  float _regular_decay, _frustum_decay;
   bool _pub_voxels;
   std::unique_ptr<std::vector<geometry_msgs::msg::Point32>> _grid_points;
   std::unordered_map<occupany_cell, uint> * _cost_map;

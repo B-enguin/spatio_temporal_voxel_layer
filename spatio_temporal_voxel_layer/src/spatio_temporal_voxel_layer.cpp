@@ -100,8 +100,18 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
   declareParameter("voxel_size", rclcpp::ParameterValue(0.05));
   node->get_parameter(name_ + ".voxel_size", _voxel_size);
   // minimum occupancy value for a voxel to be treated as occupied
-  declareParameter("occupied_threshold", rclcpp::ParameterValue(5.0));
+  declareParameter("occupied_threshold", rclcpp::ParameterValue(3.0));
   node->get_parameter(name_ + ".occupied_threshold", _occupied_threshold);
+  // affordance mean thresholds for cost scaling
+  declareParameter("cost_min_thresh", rclcpp::ParameterValue(0.1));
+  node->get_parameter(name_ + ".cost_min_thresh", _cost_min_thresh);
+  declareParameter("cost_max_thresh", rclcpp::ParameterValue(0.9));
+  node->get_parameter(name_ + ".cost_max_thresh", _cost_max_thresh);
+  // occupancy decay applied during regular updates and frustum clearing
+  declareParameter("regular_decay", rclcpp::ParameterValue(0.1));
+  node->get_parameter(name_ + ".regular_decay", _regular_decay);
+  declareParameter("frustum_decay", rclcpp::ParameterValue(0.5));
+  node->get_parameter(name_ + ".frustum_decay", _frustum_decay);
   // 1=takes highest in layers, 0=takes current layer
   declareParameter("combination_method", rclcpp::ParameterValue(1));
   node->get_parameter(name_ + ".combination_method", _combination_method);
@@ -177,7 +187,9 @@ void SpatioTemporalVoxelLayer::onInitialize(void)
 
   _voxel_grid = std::make_unique<volume_grid::SpatioTemporalVoxelGrid>(
     node->get_clock(), _voxel_size, static_cast<double>(default_value_), _decay_model,
-    _voxel_decay, _publish_voxels, static_cast<float>(_occupied_threshold));
+    _voxel_decay, _publish_voxels, static_cast<float>(_occupied_threshold),
+    static_cast<float>(_cost_min_thresh), static_cast<float>(_cost_max_thresh),
+    static_cast<float>(_regular_decay), static_cast<float>(_frustum_decay));
 
   matchSize();
 
@@ -785,15 +797,17 @@ void SpatioTemporalVoxelLayer::updateBounds(
 
   std::unordered_set<volume_grid::occupany_cell> cleared_cells;
 
-  // navigation mode: clear observations, mapping mode: save maps and publish
+  // Update voxel occupancy every tick. Clearing observations additionally
+  // decay voxels inside their frustums.
   bool should_save = false;
   auto node = node_.lock();
   if (_map_save_duration) {
     should_save = node->now() - _last_map_save_time > *_map_save_duration;
   }
-  if (!_mapping_mode) {
-    _voxel_grid->ClearFrustums(clearing_observations, cleared_cells);
-  } else if (should_save) {
+
+  _voxel_grid->ClearFrustums(clearing_observations, cleared_cells);
+
+  if (_mapping_mode && should_save) {
     _last_map_save_time = node->now();
     time_t rawtime;
     struct tm * timeinfo;
@@ -888,13 +902,11 @@ void SpatioTemporalVoxelLayer::QueryObjectCallback(
   boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
 
   if (!_voxel_grid || req->id <= 0) {
-    resp->completed = false;
     return;
   }
 
   volume_grid::ObjectInstance object;
-  resp->completed = _voxel_grid->GetObject(static_cast<uint32_t>(req->id), object);
-  if (!resp->completed) {
+  if (!_voxel_grid->GetObject(static_cast<uint32_t>(req->id), object)) {
     return;
   }
 
@@ -907,6 +919,11 @@ void SpatioTemporalVoxelLayer::QueryObjectCallback(
     affordance_msg.affordance_name = affordance.first;
     affordance_msg.alpha = affordance.second.first;
     affordance_msg.beta = affordance.second.second;
+    const auto mean_variance = object.mean_variance_values.find(affordance.first);
+    if (mean_variance != object.mean_variance_values.end()) {
+      affordance_msg.mean = mean_variance->second.first;
+      affordance_msg.variance = mean_variance->second.second;
+    }
     resp->affordances.push_back(affordance_msg);
   }
 }
@@ -925,8 +942,21 @@ void SpatioTemporalVoxelLayer::UpdateObjectCallback(
     return;
   }
 
+  std::vector<std::string> affordance_names;
+  std::vector<float> alphas;
+  std::vector<float> betas;
+  affordance_names.reserve(req->affordances.size());
+  alphas.reserve(req->affordances.size());
+  betas.reserve(req->affordances.size());
+
+  for (const auto & affordance : req->affordances) {
+    affordance_names.push_back(affordance.affordance_name);
+    alphas.push_back(affordance.alpha);
+    betas.push_back(affordance.beta);
+  }
+
   resp->completed = _voxel_grid->UpdateObject(
-    static_cast<uint32_t>(req->id), req->affordance_names, req->alphas, req->betas);
+    static_cast<uint32_t>(req->id), affordance_names, alphas, betas);
 }
 
 rcl_interfaces::msg::SetParametersResult
@@ -1044,6 +1074,34 @@ SpatioTemporalVoxelLayer::dynamicParametersCallback(std::vector<rclcpp::Paramete
         boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
         if (_voxel_grid) {
           _voxel_grid->SetOccupiedThreshold(static_cast<float>(_occupied_threshold));
+        }
+      } else if (name == name_ + "." + "cost_min_thresh") {
+        _cost_min_thresh = parameter.as_double();
+        boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+        if (_voxel_grid) {
+          _voxel_grid->SetCostThresholds(
+            static_cast<float>(_cost_min_thresh),
+            static_cast<float>(_cost_max_thresh));
+        }
+      } else if (name == name_ + "." + "cost_max_thresh") {
+        _cost_max_thresh = parameter.as_double();
+        boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+        if (_voxel_grid) {
+          _voxel_grid->SetCostThresholds(
+            static_cast<float>(_cost_min_thresh),
+            static_cast<float>(_cost_max_thresh));
+        }
+      } else if (name == name_ + "." + "regular_decay") {
+        _regular_decay = parameter.as_double();
+        boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+        if (_voxel_grid) {
+          _voxel_grid->SetRegularDecay(static_cast<float>(_regular_decay));
+        }
+      } else if (name == name_ + "." + "frustum_decay") {
+        _frustum_decay = parameter.as_double();
+        boost::recursive_mutex::scoped_lock lock(_voxel_grid_lock);
+        if (_voxel_grid) {
+          _voxel_grid->SetFrustumDecay(static_cast<float>(_frustum_decay));
         }
       }
     }

@@ -56,7 +56,6 @@ namespace
 constexpr float MIN_OCCUPANCY = 0.0f;
 constexpr float MAX_OCCUPANCY = 255.0f;
 constexpr float OCCUPANCY_MARK_INCREMENT = 1.0f;
-constexpr float OCCUPANCY_FRUSTUM_DECREMENT = 0.1f;
 constexpr float MIN_AFFORDANCE_MEAN = 0.0f;
 constexpr float MAX_AFFORDANCE_MEAN = 1.0f;
 
@@ -118,20 +117,32 @@ ComputeAffordanceMeanVariances(
   return mean_variance_values;
 }
 
-uint GetObjectCost(const uint32_t object_id, const std::unordered_map<uint32_t, ObjectInstance> & objects)
+uint GetObjectCost(
+  const uint32_t object_id, const std::unordered_map<uint32_t, ObjectInstance> & objects,
+  const float cost_min_thresh, const float cost_max_thresh)
 {
   if (object_id == 0u) {
     return nav2_costmap_2d::LETHAL_OBSTACLE;
   }
 
-  float max_mean = MIN_AFFORDANCE_MEAN;
   const auto object_it = objects.find(object_id);
-  if (object_it != objects.end()) {
-    max_mean = object_it->second.max_affordance_mean;
+  if (object_it == objects.end()) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
   }
 
+  const float min_thresh = ClampAffordanceMean(cost_min_thresh);
+  const float max_thresh = ClampAffordanceMean(cost_max_thresh);
+  if (max_thresh <= min_thresh) {
+    return nav2_costmap_2d::LETHAL_OBSTACLE;
+  }
+
+  const float max_mean = object_it->second.max_affordance_mean;
+  const float scored_mean = std::max(
+    min_thresh,
+    std::min(max_thresh, ClampAffordanceMean(max_mean)));
+  const float cost_scale = (max_thresh - scored_mean) / (max_thresh - min_thresh);
   const float scaled_cost = static_cast<float>(nav2_costmap_2d::LETHAL_OBSTACLE) *
-    (1.0f - ClampAffordanceMean(max_mean));
+    cost_scale;
   return static_cast<uint>(std::lround(ClampOccupancy(scaled_cost)));
 }
 
@@ -155,11 +166,6 @@ inline uint32_t ToObjectId(const double value)
   const double clamped = std::max(
     0.0, std::min(static_cast<double>(std::numeric_limits<uint32_t>::max()), value));
   return static_cast<uint32_t>(std::llround(clamped));
-}
-
-inline std::string ObjectName(const uint32_t id)
-{
-  return "object_" + std::to_string(id);
 }
 
 const sensor_msgs::msg::PointField * FindField(
@@ -225,10 +231,14 @@ SpatioTemporalVoxelGrid::SpatioTemporalVoxelGrid(
   rclcpp::Clock::SharedPtr clock,
   const float & voxel_size, const double & background_value,
   const int & decay_model, const double & voxel_decay, const bool & pub_voxels,
-  const float & occupied_threshold)
+  const float & occupied_threshold, const float & cost_min_thresh,
+  const float & cost_max_thresh, const float & regular_decay,
+  const float & frustum_decay)
 : _clock(clock), _decay_model(decay_model), _background_value(background_value),
   _voxel_size(voxel_size), _voxel_decay(voxel_decay),
-  _occupied_threshold(occupied_threshold), _pub_voxels(pub_voxels),
+  _occupied_threshold(occupied_threshold), _cost_min_thresh(cost_min_thresh),
+  _cost_max_thresh(cost_max_thresh), _regular_decay(regular_decay),
+  _frustum_decay(frustum_decay), _pub_voxels(pub_voxels),
   _grid_points(std::make_unique<std::vector<geometry_msgs::msg::Point32>>()),
   _cost_map(new std::unordered_map<occupany_cell, uint>),
   _objects(std::unordered_map<uint32_t, ObjectInstance>())
@@ -339,6 +349,8 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
   for (; cit_grid.test(); ++cit_grid) {
     const openvdb::Coord pt_index(cit_grid.getCoord());
     const openvdb::Vec3d pose_world = this->IndexToWorld(pt_index);
+    openvdb::Vec3f updated_value = accessor.getValue(pt_index);
+    updated_value[2] = ClampOccupancy(updated_value[2] - _regular_decay);
 
     std::vector<frustum_model>::iterator frustum_it = frustums.begin();
     bool frustum_cycle = false;
@@ -355,9 +367,7 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 
       if (frustum_it->frustum->IsInside(pose_world) ) {
         frustum_cycle = true;
-        openvdb::Vec3f updated_value = accessor.getValue(pt_index);
-        updated_value[2] = ClampOccupancy(updated_value[2] - OCCUPANCY_FRUSTUM_DECREMENT);
-        accessor.setValueOn(pt_index, updated_value);
+        updated_value[2] = ClampOccupancy(updated_value[2] - _frustum_decay);
 
         const double frustum_acceleration = GetFrustumAcceleration(
           time_since_marking, frustum_it->accel_factor);
@@ -374,9 +384,7 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
         } else {
           const double updated_mark = cit_grid.getValue()[0] -
             frustum_acceleration;
-          if (!this->MarkGridPoint(pt_index, updated_mark)) {
-            std::cout << "Failed to update mark." << std::endl;
-          }
+          updated_value[0] = static_cast<float>(updated_mark);
           break;
         }
       }
@@ -393,6 +401,17 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
       }
     }
 
+    if (!cleared_point && updated_value[2] <= MIN_OCCUPANCY) {
+      cleared_point = true;
+      if (!this->ClearGridPoint(pt_index)) {
+        std::cout << "Failed to clear point." << std::endl;
+      }
+    }
+
+    if (!cleared_point) {
+      accessor.setValueOn(pt_index, updated_value);
+    }
+
     if (cleared_point)
     {
       cleared_cells.insert(occupany_cell(pose_world[0], pose_world[1]));
@@ -404,6 +423,11 @@ void SpatioTemporalVoxelGrid::TemporalClearAndGenerateCostmap(
 
   const float occupancy_threshold = GetOccupancyThreshold();
   for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
+    if (it.getValue()[2] <= occupancy_threshold) {
+      const openvdb::Vec3d pose_world = this->IndexToWorld(it.getCoord());
+      cleared_cells.insert(occupany_cell(pose_world[0], pose_world[1]));
+      continue;
+    }
     PopulateCostmapAndPointcloud(it.getCoord(), occupancy_threshold);
   }
 }
@@ -431,7 +455,8 @@ void SpatioTemporalVoxelGrid::PopulateCostmapAndPointcloud(
   }
 
   const uint32_t object_id = ToObjectId(value[1]);
-  const uint voxel_cost = GetObjectCost(object_id, _objects);
+  const uint voxel_cost = GetObjectCost(
+    object_id, _objects, _cost_min_thresh, _cost_max_thresh);
   const occupany_cell map_cell(pose_world[0], pose_world[1]);
 
   std::unordered_map<occupany_cell, uint>::iterator cell;
@@ -513,13 +538,6 @@ void SpatioTemporalVoxelGrid::operator()(
       // A zero incoming id means "unknown"; keep the voxel's current object id.
       if (object_id != 0u) {
         value[1] = object_id_value;
-
-        ObjectInstance & object = _objects[object_id];
-        if (object.name.empty()) {
-          object.id = object_id;
-          object.name = ObjectName(object_id);
-          object.max_affordance_mean = MIN_AFFORDANCE_MEAN;
-        }
       }
       accessor.setValueOn(coord, value);
     }
@@ -718,11 +736,7 @@ bool SpatioTemporalVoxelGrid::IsGridEmpty(void) const
 float SpatioTemporalVoxelGrid::GetOccupancyThreshold(void) const
 /*****************************************************************************/
 {
-  float max_occupancy = MIN_OCCUPANCY;
-  for (openvdb::Vec3fGrid::ValueOnCIter it = _grid->cbeginValueOn(); it.test(); ++it) {
-    max_occupancy = std::max(max_occupancy, ClampOccupancy(it.getValue()[2]));
-  }
-  return std::max(_occupied_threshold, max_occupancy * 0.5f);
+  return _occupied_threshold;
 }
 
 /*****************************************************************************/
@@ -731,6 +745,32 @@ void SpatioTemporalVoxelGrid::SetOccupiedThreshold(const float occupied_threshol
 {
   boost::unique_lock<boost::mutex> lock(_grid_lock);
   _occupied_threshold = occupied_threshold;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelGrid::SetCostThresholds(
+  const float cost_min_thresh, const float cost_max_thresh)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+  _cost_min_thresh = cost_min_thresh;
+  _cost_max_thresh = cost_max_thresh;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelGrid::SetRegularDecay(const float regular_decay)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+  _regular_decay = regular_decay;
+}
+
+/*****************************************************************************/
+void SpatioTemporalVoxelGrid::SetFrustumDecay(const float frustum_decay)
+/*****************************************************************************/
+{
+  boost::unique_lock<boost::mutex> lock(_grid_lock);
+  _frustum_decay = frustum_decay;
 }
 
 /*****************************************************************************/
@@ -761,6 +801,10 @@ bool SpatioTemporalVoxelGrid::AddObject(
   boost::unique_lock<boost::mutex> lock(_grid_lock);
 
   if (id == 0u) {
+    return false;
+  }
+
+  if (_objects.find(id) != _objects.end()) {
     return false;
   }
 

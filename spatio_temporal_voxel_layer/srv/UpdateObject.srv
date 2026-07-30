@@ -1,6 +1,4 @@
 int32 id
-string[] affordance_names
-float32[] alphas
-float32[] betas
+spatio_temporal_voxel_layer/Affordance[] affordances
 ---
 bool completed

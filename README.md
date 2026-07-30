@@ -113,7 +113,11 @@ rgbd_obstacle_layer:
   observation_persistence: 0.0  #seconds
   max_obstacle_height:   2.0    #meters
   mark_threshold:        0      #voxel height
-  occupied_threshold:    5.0    #minimum voxel occupancy
+  occupied_threshold:    3.0    #minimum voxel occupancy
+  regular_decay:         0.1    #occupancy decrement per update
+  frustum_decay:         0.5    #occupancy decrement inside clearing frustums
+  cost_min_thresh:       0.1    #affordance mean for lethal cost
+  cost_max_thresh:       0.9    #affordance mean for zero cost
   update_footprint_enabled: true
   combination_method:    1      #1=max, 0=override
   obstacle_range:        3.0    #meters

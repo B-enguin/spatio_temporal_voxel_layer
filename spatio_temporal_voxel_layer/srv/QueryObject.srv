@@ -1,6 +1,5 @@
 int32 id
 ---
-bool completed
 int32 id
 string object_name
 spatio_temporal_voxel_layer/Affordance[] affordances
